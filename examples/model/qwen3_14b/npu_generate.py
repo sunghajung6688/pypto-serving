@@ -28,26 +28,21 @@ os.environ.setdefault("PTO2_RING_HEAP", str(2 * 1024 ** 3))
 
 def _bootstrap_package_root() -> None:
     this_file = Path(__file__).resolve()
-    candidates = [
-        this_file.parents[1],
-        this_file.parents[1] / "llm",
-    ]
-    for package_dir in candidates:
-        if (package_dir / "__init__.py").exists() and (package_dir / "core").is_dir():
-            package_parent = package_dir.parent
-            package_parent_str = str(package_parent)
-            if package_parent_str not in sys.path:
-                sys.path.insert(0, package_parent_str)
+    for candidate in (this_file, *this_file.parents):
+        if (candidate / "python" / "core").is_dir() and (candidate / "examples" / "model" / "qwen3_14b" / "runner").is_dir():
+            repo_root = str(candidate)
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
             return
-    raise RuntimeError(f"Unable to locate the llm package root from {this_file}")
+    raise RuntimeError(f"Unable to locate the pypto-serving repo root from {this_file}")
 
 
 _bootstrap_package_root()
 
-from llm.core import GenerateConfig, LLMEngine, RuntimeConfig
-from llm.core.kv_cache import KvCacheManager
-from llm.model.qwen3_14b_executor import Qwen314BPyptoExecutor as PyptoExecutor
-from llm.core.types import LoadedModel
+from python.core import GenerateConfig, LLMEngine, RuntimeConfig
+from python.core.kv_cache import KvCacheManager
+from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from python.core.types import LoadedModel
 import dataclasses
 
 

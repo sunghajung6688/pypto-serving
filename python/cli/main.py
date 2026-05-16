@@ -63,13 +63,14 @@ class ServingConfig:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pypto-serving",
-        description="Run local interactive generation with the llm module.",
+        description="Run local interactive generation with PyPTO Serving.",
     )
     parser.add_argument("--config", required=True, help="Path to the user-written JSON config file.")
     parser.add_argument("--prompt", help="Prompt text for one-shot generation.")
     parser.add_argument("--interactive", action="store_true", help="Read prompts interactively after loading the model.")
     parser.add_argument("--stream", action="store_true", help="Override generation.stream=true for this run.")
     parser.add_argument("--l3", action="store_true", help="Override npu.l3=true for this run.")
+    parser.add_argument("--device", type=int, help="Override npu.device_id from the JSON config.")
     parser.add_argument(
         "--show-startup-logs",
         action="store_true",
@@ -83,6 +84,7 @@ def load_serving_config(
     *,
     stream_override: bool = False,
     l3_override: bool = False,
+    device_override: int | None = None,
 ) -> ServingConfig:
     _ensure_core_imports()
     path = Path(config_path)
@@ -146,7 +148,7 @@ def load_serving_config(
 
     npu = NpuCliConfig(
         platform=_get_str(npu_section, "platform", "a2a3"),
-        device_id=_get_int(npu_section, "device_id", 0),
+        device_id=device_override if device_override is not None else _get_int(npu_section, "device_id", 0),
         save_kernels_dir=_get_optional_str(npu_section, "save_kernels_dir"),
         l3_mode=npu_l3_mode,
     )
@@ -258,6 +260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.config,
             stream_override=args.stream,
             l3_override=args.l3,
+            device_override=args.device,
         )
         engine = create_engine(config)
         init_engine(engine, config)
@@ -278,9 +281,9 @@ def _ensure_core_imports(*, cpu_executor: bool = False, executor: bool = False) 
             from ..core import LLMEngine as imported_engine
             from ..core import RuntimeConfig as imported_runtime_config
         except ImportError:
-            from core import GenerateConfig as imported_generate_config
-            from core import LLMEngine as imported_engine
-            from core import RuntimeConfig as imported_runtime_config
+            from python.core import GenerateConfig as imported_generate_config
+            from python.core import LLMEngine as imported_engine
+            from python.core import RuntimeConfig as imported_runtime_config
 
         if GenerateConfig is None:
             GenerateConfig = imported_generate_config
@@ -293,21 +296,21 @@ def _ensure_core_imports(*, cpu_executor: bool = False, executor: bool = False) 
         try:
             from ..core.kv_cache import KvCacheManager as imported_kv_cache_manager
         except ImportError:
-            from core.kv_cache import KvCacheManager as imported_kv_cache_manager
+            from python.core.kv_cache import KvCacheManager as imported_kv_cache_manager
         KvCacheManager = imported_kv_cache_manager
 
     if cpu_executor and CpuModelExecutor is None:
         try:
-            from ..model.cpu_executor import CpuModelExecutor as imported_cpu_executor
+            from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor as imported_cpu_executor
         except ImportError:
-            from model.cpu_executor import CpuModelExecutor as imported_cpu_executor
+            from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor as imported_cpu_executor
         CpuModelExecutor = imported_cpu_executor
 
     if executor and PyptoExecutor is None:
         try:
-            from ..model.qwen3_14b_executor import Qwen314BPyptoExecutor as imported_executor
+            from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as imported_executor
         except ImportError:
-            from model.qwen3_14b_executor import Qwen314BPyptoExecutor as imported_executor
+            from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as imported_executor
         PyptoExecutor = imported_executor
 
 

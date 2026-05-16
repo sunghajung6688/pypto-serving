@@ -14,9 +14,9 @@ import math
 import torch
 
 try:
-    from ..core.executor import ModelExecutor
-    from ..core.kv_cache import KvCacheManager
-    from ..core.types import (
+    from python.core.executor import ModelExecutor
+    from python.core.kv_cache import KvCacheManager
+    from python.core.types import (
         DecodeBatch,
         DecodeResult,
         LayerWeights,
@@ -25,9 +25,9 @@ try:
         RuntimeModel,
     )
 except ImportError:
-    from core.executor import ModelExecutor
-    from core.kv_cache import KvCacheManager
-    from core.types import (
+    from python.core.executor import ModelExecutor
+    from python.core.kv_cache import KvCacheManager
+    from python.core.types import (
         DecodeBatch,
         DecodeResult,
         LayerWeights,

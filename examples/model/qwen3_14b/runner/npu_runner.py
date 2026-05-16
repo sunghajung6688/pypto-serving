@@ -15,10 +15,10 @@ from dataclasses import dataclass
 import torch
 
 try:
-    from ..core._profiling import StageTimer
-    from ..core.kv_cache import KvCacheManager
-    from ..core.model_runner import ModelRunner
-    from ..core.types import (
+    from python.core._profiling import StageTimer
+    from python.core.kv_cache import KvCacheManager
+    from python.core.model_runner import ModelRunner
+    from python.core.types import (
         DecodeBatch,
         DecodeResult,
         KvAllocation,
@@ -26,12 +26,12 @@ try:
         PrefillResult,
         RuntimeModel,
     )
-    from ..core.utils import backend_type_for_platform
+    from python.core.utils import backend_type_for_platform
 except ImportError:
-    from core._profiling import StageTimer
-    from core.kv_cache import KvCacheManager
-    from core.model_runner import ModelRunner
-    from core.types import (
+    from python.core._profiling import StageTimer
+    from python.core.kv_cache import KvCacheManager
+    from python.core.model_runner import ModelRunner
+    from python.core.types import (
         DecodeBatch,
         DecodeResult,
         KvAllocation,
@@ -39,7 +39,7 @@ except ImportError:
         PrefillResult,
         RuntimeModel,
     )
-    from core.utils import backend_type_for_platform
+    from python.core.utils import backend_type_for_platform
 
 _TIMING_ENABLED = True
 _LOGITS_BATCH_TILE = 16
@@ -188,7 +188,7 @@ class Qwen314BModelRunner(ModelRunner):
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Run the fused all-layer decode kernel and project next-token logits."""
-        # The fused decode kernel (qwen3_14b_decode_full.py) processes all
+        # The fused decode kernel (decode_full.py) processes all
         # layers in one call: weights are pre-stacked into [num_layers * ...]
         # tensors at compile time and the KV cache is the full multi-layer
         # buffer. Argument order mirrors the kernel signature in

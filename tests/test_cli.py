@@ -16,12 +16,12 @@ from types import SimpleNamespace
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import llm.cli.main as cli
-from llm.core import GenerateConfig, RuntimeConfig
+import python.cli.main as cli
+from python.core import GenerateConfig, RuntimeConfig
 
 
 class _FakeEngine:
@@ -143,6 +143,20 @@ def test_load_serving_config_applies_l3_cli_overrides(tmp_path):
     assert config.npu.l3_mode is True
 
 
+def test_load_serving_config_applies_device_cli_override(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config_data = _base_config(model_dir, backend="npu")
+    config_data["npu"] = {
+        "device_id": 3,
+    }
+    config_path = _write_config(tmp_path, config_data)
+
+    config = cli.load_serving_config(config_path, device_override=7)
+
+    assert config.npu.device_id == 7
+
+
 def test_load_serving_config_rejects_missing_model_dir(tmp_path):
     config_path = _write_config(
         tmp_path,
@@ -174,6 +188,26 @@ def test_main_one_shot_cpu_uses_json_config(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "text: generated:hello" in out
     assert "finish_reason: length" in out
+
+
+def test_main_passes_device_override_to_config_loader(tmp_path, monkeypatch):
+    _FakeEngine.instances.clear()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config_path = _write_config(tmp_path, _base_config(model_dir, backend="cpu"))
+    seen_kwargs = {}
+    real_load_serving_config = cli.load_serving_config
+
+    def fake_load_serving_config(path, **kwargs):
+        seen_kwargs.update(kwargs)
+        return real_load_serving_config(path, **kwargs)
+
+    monkeypatch.setattr(cli, "load_serving_config", fake_load_serving_config)
+    monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
+
+    assert cli.main(["--config", str(config_path), "--prompt", "hello", "--device", "9"]) == 0
+
+    assert seen_kwargs["device_override"] == 9
 
 
 def test_main_suppresses_startup_logs_by_default(tmp_path, monkeypatch):

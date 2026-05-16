@@ -13,11 +13,11 @@ import torch
 
 
 try:
-    from ..core._profiling import StageTimer
-    from ..core.kv_cache import KvCacheManager
-    from ..core.model_runner import ModelRunner
-    from ..core.pypto_executor import PyptoExecutor as CorePyptoExecutor
-    from ..core.types import (
+    from python.core._profiling import StageTimer
+    from python.core.kv_cache import KvCacheManager
+    from python.core.model_runner import ModelRunner
+    from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
+    from python.core.types import (
         GenerateConfig,
         GenerateResult,
         ModelRecord,
@@ -25,19 +25,19 @@ try:
         RequestState,
         RuntimeModel,
     )
-    from ..core.utils import rope_tables, round_up
-    from .qwen3_14b_runner import (
+    from python.core.utils import rope_tables, round_up
+    from .npu_runner import (
         _CompiledKernels,
         _KernelLayerWeights,
         _LOGITS_BATCH_TILE,
         Qwen314BModelRunner,
     )
 except ImportError:
-    from core._profiling import StageTimer
-    from core.kv_cache import KvCacheManager
-    from core.model_runner import ModelRunner
-    from core.pypto_executor import PyptoExecutor as CorePyptoExecutor
-    from core.types import (
+    from python.core._profiling import StageTimer
+    from python.core.kv_cache import KvCacheManager
+    from python.core.model_runner import ModelRunner
+    from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
+    from python.core.types import (
         GenerateConfig,
         GenerateResult,
         ModelRecord,
@@ -45,8 +45,8 @@ except ImportError:
         RequestState,
         RuntimeModel,
     )
-    from core.utils import rope_tables, round_up
-    from model.qwen3_14b_runner import (
+    from python.core.utils import rope_tables, round_up
+    from examples.model.qwen3_14b.runner.npu_runner import (
         _CompiledKernels,
         _KernelLayerWeights,
         _LOGITS_BATCH_TILE,
@@ -54,7 +54,7 @@ except ImportError:
     )
 
 
-_VOCAB_PAD_MULTIPLE = 512  # must be a multiple of qwen3_14b_lm_head.VOCAB_CHUNK (64)
+_VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
 _QWEN14B_PAGE_SIZE = 256
 
 
@@ -266,24 +266,14 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             timer.mark(label)
 
         from pypto.runtime import run
-        try:
-            from ..model.qwen3_14b_decode import build_qwen3_decode_program
-            from ..model.qwen3_14b_final_rms import build_qwen3_final_rms_program
-            from ..model.qwen3_14b_l3_generate import (
-                build_qwen3_14b_l3_generate_program,
-                stack_layer_weights_full,
-            )
-            from ..model.qwen3_14b_lm_head import build_qwen3_lm_head_program
-            from ..model.qwen3_14b_prefill import build_qwen3_14b_prefill_program
-        except ImportError:
-            from model.qwen3_14b_decode import build_qwen3_decode_program
-            from model.qwen3_14b_final_rms import build_qwen3_final_rms_program
-            from model.qwen3_14b_l3_generate import (
-                build_qwen3_14b_l3_generate_program,
-                stack_layer_weights_full,
-            )
-            from model.qwen3_14b_lm_head import build_qwen3_lm_head_program
-            from model.qwen3_14b_prefill import build_qwen3_14b_prefill_program
+        from examples.model.qwen3_14b.src.decode_full import build_qwen3_decode_program
+        from examples.model.qwen3_14b.src.final_rms import build_qwen3_final_rms_program
+        from examples.model.qwen3_14b.src.l3_generate import (
+            build_qwen3_14b_l3_generate_program,
+            stack_layer_weights_full,
+        )
+        from examples.model.qwen3_14b.src.lm_head import build_qwen3_lm_head_program
+        from examples.model.qwen3_14b.src.prefill import build_qwen3_14b_prefill_program
         _mark("imports")
 
         self._validate_supported_shape(model)

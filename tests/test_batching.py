@@ -9,9 +9,9 @@
 
 import torch
 
-from core.engine import LLMEngine
-from core.kv_cache import KvCacheManager
-from core.types import (
+from python.core.engine import LLMEngine
+from python.core.kv_cache import KvCacheManager
+from python.core.types import (
     DecodeBatch,
     GenerateConfig,
     LayerWeights,
@@ -21,10 +21,10 @@ from core.types import (
     RuntimeConfig,
     RuntimeModel,
 )
-from model.cpu_executor import CpuModelExecutor
-from model.qwen3_14b_executor import Qwen314BPyptoExecutor as PyptoExecutor
-from model.qwen3_14b_runner import Qwen314BModelRunner as ModelRunner
-from model.qwen3_14b_runner import _CompiledKernels
+from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor
+from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner as ModelRunner
+from examples.model.qwen3_14b.runner.npu_runner import _CompiledKernels
 
 
 class _Tokenizer:
