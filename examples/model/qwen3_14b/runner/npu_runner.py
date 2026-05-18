@@ -365,7 +365,7 @@ class Qwen314BModelRunner(ModelRunner):
         worker.run(handle.callable_id, orch_args, cfg)
 
     def _worker_for_runtime(self, runtime_name: str) -> LlmWorker:
-        """Return an initialized L2 worker for ``runtime_name``."""
+        """Return an initialized worker for ``runtime_name``."""
         worker = self._l2_workers.get(runtime_name)
         if worker is not None:
             return worker

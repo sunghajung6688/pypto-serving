@@ -10,16 +10,22 @@ handling.
 ```text
 python/
   cli/                         pypto-serving CLI implementation
-  core/                        engine, scheduler, KV cache, model loading
+  core/                        engine, scheduler, KV cache, model loading, async serving
+  runtime/                     Simpler worker wrapper for NPU dispatch
 pypto-lib/                     submodule providing Qwen3-14B PyPTO kernels
 examples/
   pypto-serving                executable CLI wrapper
   model/qwen3_14b/
     cpu_generate.py            CPU reference generation example
     npu_generate.py            NPU generation/profiling example
-    npu_serving.json           sample interactive serving config
+    npu_serving.json           sample serving config
     runner/                    Qwen3 executors and runner glue
+<<<<<<< HEAD
 tests/                         CLI and batching tests
+=======
+    src/                       PyPTO kernel/program builders
+tests/                         CLI, batching, E2E serving, and benchmark tests
+>>>>>>> b2fca02 (Add serving V2: multiprocess worker + dynamic batching + HTTP API)
 ```
 
 ## Quick Checks
@@ -85,6 +91,45 @@ task-submit --run -i \
 At the `[user]` prompt, enter a prompt such as `Huawei is`; use `/exit` or
 `/quit` to leave the interactive session.
 
+## HTTP Serving (OpenAI-compatible API)
+
+Start the serving server with multiprocess worker:
+
+```bash
+task-submit --device auto --max-time 0 --run \
+  "python -m python.cli.main \
+    --config examples/model/qwen3_14b/npu_serving.json \
+    --serve --port 8899 --device {}"
+```
+
+Test with curl:
+
+```bash
+# Health check
+curl http://localhost:8899/health
+
+# Completion
+curl http://localhost:8899/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Huawei is", "max_tokens": 32, "temperature": 0.0}'
+
+# Streaming
+curl http://localhost:8899/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Huawei is", "max_tokens": 32, "stream": true}'
+
+# Chat completion
+curl http://localhost:8899/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
+```
+
+Run the serving benchmark:
+
+```bash
+python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
+```
+
 ## Notes
 
 - The sample config points at `/data/linyifan/models/Qwen3-14B`; edit
@@ -97,3 +142,5 @@ At the `[user]` prompt, enter a prompt such as `Huawei is`; use `/exit` or
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the
   local Ascend runtime environment to be available in the active Python
   environment.
+- HTTP serving mode additionally requires `fastapi`, `uvicorn`, and `pydantic`.
+  The benchmark script requires `aiohttp`.
