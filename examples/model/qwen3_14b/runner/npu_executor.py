@@ -65,6 +65,41 @@ _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
 _QWEN14B_PAGE_SIZE = 256
 
 
+def _find_pypto_lib_qwen14b_dir() -> Path:
+    """Find the Qwen3-14B kernel directory in the pypto-lib submodule."""
+    start_dir = Path(__file__).resolve().parent
+    for directory in (start_dir, *start_dir.parents):
+        pypto_lib_dir = directory / "pypto-lib"
+        if pypto_lib_dir.is_dir() or (directory / ".gitmodules").is_file():
+            return pypto_lib_dir / "models" / "qwen3" / "14b"
+    raise FileNotFoundError(
+        "Cannot locate the pypto-lib submodule from npu_executor.py. "
+        "Run from a pypto-serving checkout with `git submodule update --init --recursive`."
+    )
+
+
+_PYPTO_LIB_QWEN14B_DIR = _find_pypto_lib_qwen14b_dir()
+
+
+def _load_pypto_lib_qwen14b_module(module_name: str) -> object:
+    """Load a Qwen3-14B kernel module from the pypto-lib submodule."""
+    module_path = _PYPTO_LIB_QWEN14B_DIR / f"qwen3_14b_{module_name}.py"
+    if not module_path.is_file():
+        raise FileNotFoundError(
+            f"Missing pypto-lib Qwen3-14B kernel module: {module_path}. "
+            "Run `git submodule update --init --recursive`."
+        )
+    spec = importlib.util.spec_from_file_location(
+        f"_pypto_lib_qwen3_14b_{module_name}",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load pypto-lib kernel module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _patch_orch_make_tensor_arg(module: object) -> None:
     """Allow ``make_tensor_arg`` in a generated orchestration module to pass
     ``ContinuousTensor`` objects through unchanged.
@@ -273,14 +308,18 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         def _mark(label: str) -> None:
             timer.mark(label)
 
-        from examples.model.qwen3_14b.src.decode_full import build_qwen3_decode_program
-        from examples.model.qwen3_14b.src.final_rms import build_qwen3_final_rms_program
-        from examples.model.qwen3_14b.src.l3_generate import (
-            build_qwen3_14b_l3_generate_program,
-            stack_layer_weights_full,
-        )
-        from examples.model.qwen3_14b.src.lm_head import build_qwen3_lm_head_program
-        from examples.model.qwen3_14b.src.prefill import build_qwen3_14b_prefill_program
+        qwen3_decode_full = _load_pypto_lib_qwen14b_module("decode_full")
+        qwen3_final_rms = _load_pypto_lib_qwen14b_module("final_rms")
+        qwen3_l3_generate = _load_pypto_lib_qwen14b_module("l3_generate")
+        qwen3_lm_head = _load_pypto_lib_qwen14b_module("lm_head")
+        qwen3_prefill = _load_pypto_lib_qwen14b_module("prefill")
+
+        build_qwen3_decode_program = qwen3_decode_full.build_qwen3_decode_program
+        build_qwen3_final_rms_program = qwen3_final_rms.build_qwen3_final_rms_program
+        build_qwen3_14b_l3_generate_program = qwen3_l3_generate.build_qwen3_14b_l3_generate_program
+        stack_layer_weights_full = qwen3_l3_generate.stack_layer_weights_full
+        build_qwen3_lm_head_program = qwen3_lm_head.build_qwen3_lm_head_program
+        build_qwen3_14b_prefill_program = qwen3_prefill.build_qwen3_14b_prefill_program
         _mark("imports")
 
         self._validate_supported_shape(model)

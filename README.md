@@ -2,7 +2,7 @@
 
 PyPTO Serving is a small local inference stack for running Qwen3-14B generation
 with PyPTO kernels on Ascend NPUs. It includes a reusable Python runtime,
-Qwen3-14B example kernels, CLI entry points, and tests for batching and config
+Qwen3-14B executor glue, CLI entry points, and tests for batching and config
 handling.
 
 ## Layout
@@ -11,6 +11,7 @@ handling.
 python/
   cli/                         pypto-serving CLI implementation
   core/                        engine, scheduler, KV cache, model loading
+pypto-lib/                     submodule providing Qwen3-14B PyPTO kernels
 examples/
   pypto-serving                executable CLI wrapper
   model/qwen3_14b/
@@ -18,11 +19,16 @@ examples/
     npu_generate.py            NPU generation/profiling example
     npu_serving.json           sample interactive serving config
     runner/                    Qwen3 executors and runner glue
-    src/                       PyPTO kernel/program builders
 tests/                         CLI and batching tests
 ```
 
 ## Quick Checks
+
+Initialize the kernel submodule after cloning:
+
+```bash
+git submodule update --init --recursive
+```
 
 Run the unit tests:
 
