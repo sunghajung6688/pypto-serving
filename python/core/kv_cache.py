@@ -16,6 +16,27 @@ import torch
 
 from .types import KvAllocation, ModelConfig, RuntimeConfig
 
+# Lazy import to avoid hard dependency when quantization is disabled.
+_KVCOMPRESSOR = None
+
+
+def _get_kv_compressor_cls():
+    global _KVCOMPRESSOR
+    if _KVCOMPRESSOR is None:
+        from .turboquant.compressor import KVCompressor
+        _KVCOMPRESSOR = KVCompressor
+    return _KVCOMPRESSOR
+
+
+@dataclass
+class _CompressedSegment:
+    """Compressed KV data for a contiguous range of old tokens in one layer."""
+
+    token_start: int
+    token_count: int
+    compressed_k: dict
+    compressed_v: dict
+
 
 @dataclass
 class _CachePool:
@@ -29,6 +50,11 @@ class _CachePool:
     key_pages: torch.Tensor
     value_pages: torch.Tensor
     free_pages: list[int]
+    # KV quantization (None when disabled)
+    kv_compressor: object = None  # KVCompressor | None
+    kv_quant_config: object = None  # KvQuantConfig | None
+    # Compressed segments: {request_id: {layer_idx: _CompressedSegment}}
+    compressed_segments: dict = None
 
 
 class KvCacheManager:
@@ -57,6 +83,20 @@ class KvCacheManager:
             device=runtime.device,
         )
         value_pages = torch.zeros_like(key_pages)
+        # Initialize KV quantization if configured
+        kv_compressor = None
+        kv_quant_config = runtime.kv_quant_config
+        compressed_segments = None
+        if kv_quant_config is not None and kv_quant_config.enabled:
+            KVCompressor = _get_kv_compressor_cls()
+            kv_compressor = KVCompressor(
+                head_dim=config.head_dim,
+                num_layers=config.num_hidden_layers,
+                config=kv_quant_config,
+                device=runtime.device,
+            )
+            compressed_segments = {}
+
         self._pools[model_id] = _CachePool(
             page_size=runtime.page_size,
             num_layers=config.num_hidden_layers,
@@ -66,6 +106,9 @@ class KvCacheManager:
             key_pages=key_pages,
             value_pages=value_pages,
             free_pages=list(range(num_pages - 1, -1, -1)),
+            kv_compressor=kv_compressor,
+            kv_quant_config=kv_quant_config,
+            compressed_segments=compressed_segments,
         )
 
     def allocate_for_prompt(self, model_id: str, request_id: str, prompt_len: int) -> KvAllocation:
@@ -255,6 +298,126 @@ class KvCacheManager:
         alloc.page_ids.clear()
         alloc.tokens_capacity = 0
         alloc.tokens_used = 0
+        # Also clean up compressed segments for this request
+        if pool.compressed_segments is not None:
+            pool.compressed_segments.pop(alloc.request_id, None)
+
+    # ── KV cache quantization ──
+
+    def is_quantization_enabled(self, model_id: str) -> bool:
+        """Return whether KV cache quantization is enabled for a model."""
+        pool = self._pool(model_id)
+        return pool.kv_compressor is not None
+
+    def restore_compressed_tokens(self, model_id: str, alloc: KvAllocation) -> None:
+        """Decompress old tokens back into bf16 cache pages before kernel execution.
+
+        This writes the previously compressed old tokens back into their original
+        page locations in key_pages/value_pages so the kernel can read them.
+        """
+        pool = self._pool(model_id)
+        if pool.compressed_segments is None or pool.kv_compressor is None:
+            return
+        req_segments = pool.compressed_segments.get(alloc.request_id)
+        if not req_segments:
+            return
+
+        for layer_idx, segment in req_segments.items():
+            # Decompress
+            keys, values = pool.kv_compressor.decompress_layer(
+                layer_idx, segment.compressed_k, segment.compressed_v,
+            )
+            # keys, values: (S_old, H, D) — write back into paged cache
+            self._write_tokens_from_compressed(
+                pool, layer_idx, alloc, segment.token_start, keys, values,
+            )
+
+    def compress_old_tokens(self, model_id: str, alloc: KvAllocation) -> None:
+        """Compress old tokens (beyond residual_window) and store compressed data.
+
+        Tokens with index < (tokens_used - residual_window) are compressed.
+        The bf16 cache pages are NOT freed (they are reused in-place on next restore).
+        """
+        pool = self._pool(model_id)
+        if pool.kv_compressor is None or pool.kv_quant_config is None:
+            return
+
+        residual_window = pool.kv_quant_config.residual_window
+        tokens_used = alloc.tokens_used
+        if tokens_used <= residual_window:
+            return  # Not enough tokens to compress
+
+        old_token_count = tokens_used - residual_window
+
+        # Initialize compressed segments dict for this request
+        if pool.compressed_segments is None:
+            pool.compressed_segments = {}
+        if alloc.request_id not in pool.compressed_segments:
+            pool.compressed_segments[alloc.request_id] = {}
+
+        for layer_idx in range(pool.num_layers):
+            # Read old tokens from bf16 cache
+            old_keys, old_values = self.read_context(
+                layer_idx, alloc, upto_tokens=old_token_count,
+            )
+            # old_keys, old_values: (S_old, H, D)
+
+            # Compress
+            compressed_k, compressed_v = pool.kv_compressor.compress_layer(
+                layer_idx, old_keys, old_values,
+            )
+
+            # Store
+            pool.compressed_segments[alloc.request_id][layer_idx] = _CompressedSegment(
+                token_start=0,
+                token_count=old_token_count,
+                compressed_k=compressed_k,
+                compressed_v=compressed_v,
+            )
+
+    def _write_tokens_from_compressed(
+        self,
+        pool: _CachePool,
+        layer_idx: int,
+        alloc: KvAllocation,
+        start_token_index: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Write decompressed tokens back into paged cache.
+
+        keys, values: (S, H, D) — will be cast to the cache dtype.
+        """
+        cache_dtype = pool.key_pages.dtype
+        for row in range(keys.shape[0]):
+            token_index = start_token_index + row
+            page_idx = token_index // pool.page_size
+            offset = token_index % pool.page_size
+            physical_page = alloc.page_ids[page_idx]
+            pool.key_pages[layer_idx, physical_page, :, offset, :] = keys[row].to(cache_dtype)
+            pool.value_pages[layer_idx, physical_page, :, offset, :] = values[row].to(cache_dtype)
+
+    def quantization_stats(self, model_id: str) -> dict:
+        """Return memory usage stats for compressed KV cache."""
+        pool = self._pool(model_id)
+        if pool.compressed_segments is None:
+            return {"enabled": False}
+        total_compressed_bytes = 0
+        total_segments = 0
+        for req_segments in pool.compressed_segments.values():
+            for segment in req_segments.values():
+                for tensor in segment.compressed_k.values():
+                    if isinstance(tensor, torch.Tensor):
+                        total_compressed_bytes += tensor.numel() * tensor.element_size()
+                for tensor in segment.compressed_v.values():
+                    if isinstance(tensor, torch.Tensor):
+                        total_compressed_bytes += tensor.numel() * tensor.element_size()
+                total_segments += 1
+        return {
+            "enabled": True,
+            "total_segments": total_segments,
+            "compressed_bytes": total_compressed_bytes,
+        }
 
     def _pool(self, model_id: str) -> _CachePool:
         """Return the registered cache pool for a model."""
