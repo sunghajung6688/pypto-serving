@@ -31,8 +31,12 @@ class ServingConfig:
     long_prefill_token_threshold: int = 2048
     max_seq_len: int = 4096
     engine_loop_interval: float = 0.001
-    block_size: int = 256
+    # Must equal RuntimeConfig.page_size for unified block/page management
+    block_size: int = 64
     num_blocks: int | None = None
+    # Feature flags
+    enable_prefix_cache: bool = True
+    enable_chunk_prefill: bool = True
 
 
 @dataclass
@@ -86,6 +90,8 @@ class AsyncLLMEngine:
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
             max_seq_len=self.config.max_seq_len,
+            enable_prefix_cache=self.config.enable_prefix_cache,
+            enable_chunk_prefill=self.config.enable_chunk_prefill,
         )
         self.scheduler = Scheduler(config=scheduler_config, block_pool=self.block_pool)
 

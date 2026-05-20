@@ -90,7 +90,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--long-prefill-token-threshold",
         type=int,
         default=2048,
-        help="Chunked prefill threshold in serving mode (default: 2048).",
+        help="Chunked prefill threshold in serving mode (default: 2048). Set to 0 to disable chunk prefill.",
+    )
+    parser.add_argument(
+        "--disable-prefix-cache",
+        action="store_true",
+        help="Disable prefix caching (hash-based KV cache reuse across requests).",
+    )
+    parser.add_argument(
+        "--disable-chunk-prefill",
+        action="store_true",
+        help="Disable chunk prefill (always process full prompt in one step).",
     )
     parser.add_argument("--device", type=int, help="Override npu.device_id from the JSON config.")
     parser.add_argument(
@@ -281,6 +291,8 @@ def run_serve(
     max_num_running_reqs: int = 32,
     max_num_scheduled_tokens: int = 4096,
     long_prefill_token_threshold: int = 2048,
+    disable_prefix_cache: bool = False,
+    disable_chunk_prefill: bool = False,
 ) -> None:
     import asyncio
 
@@ -323,6 +335,8 @@ def run_serve(
         long_prefill_token_threshold=long_prefill_token_threshold,
         max_seq_len=config.runtime.max_seq_len,
         block_size=config.runtime.page_size,
+        enable_prefix_cache=not disable_prefix_cache,
+        enable_chunk_prefill=not disable_chunk_prefill,
     )
 
     async_engine = AsyncLLMEngine(
@@ -349,6 +363,8 @@ def run_serve(
     print(f"  Max running requests: {max_num_running_reqs}")
     print(f"  Max scheduled tokens/iter: {max_num_scheduled_tokens}")
     print(f"  Chunked prefill threshold: {long_prefill_token_threshold}")
+    print(f"  Prefix cache: {'enabled' if not disable_prefix_cache else 'disabled'}")
+    print(f"  Chunk prefill: {'enabled' if not disable_chunk_prefill else 'disabled'}")
     print(f"  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
@@ -379,6 +395,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_num_running_reqs=args.max_num_running_reqs,
             max_num_scheduled_tokens=args.max_num_scheduled_tokens,
             long_prefill_token_threshold=args.long_prefill_token_threshold,
+            disable_prefix_cache=args.disable_prefix_cache,
+            disable_chunk_prefill=args.disable_chunk_prefill,
         )
     elif args.interactive:
         run_interactive(engine, config)
