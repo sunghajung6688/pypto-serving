@@ -20,12 +20,8 @@ examples/
     npu_generate.py            NPU generation/profiling example
     npu_serving.json           sample serving config
     runner/                    Qwen3 executors and runner glue
-<<<<<<< HEAD
-tests/                         CLI and batching tests
-=======
     src/                       PyPTO kernel/program builders
 tests/                         CLI, batching, E2E serving, and benchmark tests
->>>>>>> b2fca02 (Add serving V2: multiprocess worker + dynamic batching + HTTP API)
 ```
 
 ## Quick Checks
