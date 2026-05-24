@@ -103,7 +103,7 @@ class MSECompressor:
 
         return {
             "idx_bytes": idx_bytes.reshape(B, H, S, n_groups),
-            "vec_norms": vec_norms.to(torch.float16).reshape(B, H, S),
+            "vec_norms": vec_norms.reshape(B, H, S),
             "shape": (B, H, S, D),
             "idx_pad": idx_pad,
         }

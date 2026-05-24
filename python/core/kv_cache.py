@@ -36,6 +36,7 @@ class _CompressedSegment:
     token_count: int
     compressed_k: dict
     compressed_v: dict
+    freed_page_ids: list[int] = field(default_factory=list)
 
 
 NONE_HASH = hash(("__none__",))
@@ -195,13 +196,16 @@ class KvCacheManager:
         kv_quant_config = runtime.kv_quant_config
         num_pages = runtime.total_kv_pages
         if num_pages is None and kv_quant_config is not None and kv_quant_config.enabled:
-            resident_per_seq = max(1, math.ceil(kv_quant_config.residual_window / runtime.page_size))
-            workspace_pages = max_blocks_per_seq  # enough for one full sequence
-            num_pages = runtime.max_batch_size * resident_per_seq + workspace_pages
+            # NOTE: The fused NPU decode kernel has the per-layer cache stride
+            # (num_pages * num_kv_heads * page_size) baked in at compile time.
+            # Reducing the page count would cause incorrect layer offsets and a
+            # device hang.  Keep the full page count; TurboQuant saves memory by
+            # compressing old tokens in-place (freeing bf16 pages back to the
+            # pool for reuse by *other* requests on the same model).
+            num_pages = runtime.max_batch_size * max_blocks_per_seq
             print(
-                f"[TurboQuant] Reduced bf16 pages: {runtime.max_batch_size}×{resident_per_seq} resident "
-                f"+ {workspace_pages} workspace = {num_pages} pages "
-                f"(vs {runtime.max_batch_size * max_blocks_per_seq} without compression)",
+                f"[TurboQuant] Using full bf16 pages ({num_pages}) to match "
+                f"compiled kernel stride. Compression frees pages for reuse.",
                 flush=True,
             )
         if num_pages is None:
@@ -515,7 +519,11 @@ class KvCacheManager:
             pool.compressed_segments.pop(request_id, None)
 
     def restore_compressed_tokens(self, model_id: str, alloc: KvAllocation, npu_runner=None) -> None:
-        """Decompress old tokens into workspace pages and prepend them before kernel execution.
+        """Decompress old tokens back into pages and prepend before kernel execution.
+
+        Takes pages from the free pool (same count as were freed during compression)
+        so the total page count equals the pre-compression count, never exceeding
+        max_blocks_per_seq.
 
         Args:
             npu_runner: If provided, use NPU kernels for decompress. Otherwise
@@ -533,26 +541,24 @@ class KvCacheManager:
         compressed_token_count = sample_segment.token_count
         needed_pages = compressed_token_count // pool.page_size
 
-        # Allocate workspace pages from the free pool.
-        workspace_pages = self._take_pages(pool, needed_pages)
+        # Take pages from the free pool (same count as were freed by compress).
+        restore_pages = self._take_pages(pool, needed_pages)
         print(
             f"[TurboQuant] Restoring compressed tokens for request {alloc.request_id}: "
-            f"{compressed_token_count} old tokens into {needed_pages} workspace pages",
+            f"{compressed_token_count} old tokens into {needed_pages} pages {restore_pages}",
             flush=True,
         )
 
-        # Build a temporary allocation view over workspace pages so that
-        # _write_tokens_from_compressed indexes them correctly (old tokens
-        # start at logical index 0 within the workspace).
-        workspace_alloc = KvAllocation(
+        # Build a temporary allocation over restore pages for writing.
+        restore_alloc = KvAllocation(
             request_id=alloc.request_id,
             model_id=alloc.model_id,
-            page_ids=workspace_pages,
+            page_ids=restore_pages,
             tokens_capacity=needed_pages * pool.page_size,
             tokens_used=0,
         )
 
-        # Decompress old tokens into workspace pages.
+        # Decompress old tokens into restore pages.
         for layer_idx, segment in req_segments.items():
             if npu_runner is not None:
                 keys, values = pool.kv_compressor.decompress_layer_npu(
@@ -564,26 +570,31 @@ class KvCacheManager:
                     layer_idx, segment.compressed_k, segment.compressed_v,
                 )
             self._write_tokens_from_compressed(
-                pool, layer_idx, workspace_alloc, 0, keys, values,
+                pool, layer_idx, restore_alloc, 0, keys, values,
             )
 
-        # Prepend workspace pages so that old tokens (workspace) come before
-        # resident tokens in the page_ids list.  The kernel accesses tokens
-        # via page_ids[logical_page_idx], so this gives the correct mapping.
-        alloc.page_ids = workspace_pages + alloc.page_ids
+        # Prepend restore pages so old tokens come before resident tokens.
+        # Total pages = needed_pages + resident pages.  Since ensure_one_more_slot
+        # already allocated a page for the decode token (between run_decode calls),
+        # the alloc may have grown by one.  Trim back to max_blocks_per_seq if needed
+        # — the decode page from ensure_one_more_slot is now subsumed by the restore.
+        alloc.page_ids = restore_pages + alloc.page_ids
         alloc.tokens_capacity = len(alloc.page_ids) * pool.page_size
 
-        # Ensure room for the next decode token.  After restore the layout
-        # covers all existing tokens, but the decode step writes one new
-        # token at position tokens_used.  If that position falls exactly on
-        # a page boundary we need one more page.
-        while alloc.tokens_used >= alloc.tokens_capacity:
-            alloc.page_ids.extend(self._take_pages(pool, 1))
+        if len(alloc.page_ids) > pool.max_blocks_per_seq:
+            excess = len(alloc.page_ids) - pool.max_blocks_per_seq
+            trimmed = alloc.page_ids[pool.max_blocks_per_seq:]
+            alloc.page_ids = alloc.page_ids[:pool.max_blocks_per_seq]
             alloc.tokens_capacity = len(alloc.page_ids) * pool.page_size
+            pool.free_pages.extend(trimmed)
+            print(
+                f"[TurboQuant] Trimmed {excess} excess pages to fit max_blocks={pool.max_blocks_per_seq}",
+                flush=True,
+            )
 
         print(
             f"[TurboQuant] Restore complete, {alloc.tokens_used} tokens, "
-            f"{len(alloc.page_ids)} total pages (workspace + resident + decode), "
+            f"{len(alloc.page_ids)} total pages, "
             f"capacity={alloc.tokens_capacity}",
             flush=True,
         )
@@ -675,6 +686,10 @@ class KvCacheManager:
         alloc.page_ids = alloc.page_ids[old_page_count:]
         alloc.tokens_capacity = len(alloc.page_ids) * pool.page_size
         pool.free_pages.extend(freed_pages)
+        # Store freed page IDs in every layer's segment so restore can reuse
+        # the exact same physical pages (avoids exceeding max_blocks_per_seq).
+        for seg in pool.compressed_segments[alloc.request_id].values():
+            seg.freed_page_ids = freed_pages
         print(
             f"[TurboQuant] Freed {len(freed_pages)} bf16 pages, "
             f"{len(alloc.page_ids)} resident pages remain, "
