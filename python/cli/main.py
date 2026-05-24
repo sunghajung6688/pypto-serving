@@ -132,6 +132,7 @@ def load_serving_config(
     runtime_section = _require_mapping(root.get("runtime"), "runtime")
     generation_section = _require_mapping(root.get("generation"), "generation")
     npu_section = _optional_mapping(root.get("npu"), "npu")
+    kv_quant_section = _optional_mapping(root.get("kv_quant"), "kv_quant")
 
     backend = _get_str(runtime_section, "backend", "npu").lower()
     if backend not in _VALID_BACKENDS:
@@ -167,15 +168,30 @@ def load_serving_config(
             f"npu.l3 requires runtime.max_batch_size={_L3_BATCH_TILE}; "
             f"got {max_batch_size}."
         )
+    # Parse KV quantization config
+    from python.core.types import KvQuantConfig
+    kv_quant_enabled = _get_bool(kv_quant_section, "enabled", False)
+    kv_quant_config = None
+    if kv_quant_enabled:
+        kv_quant_config = KvQuantConfig(
+            enabled=True,
+            key_bits=_get_int(kv_quant_section, "key_bits", 4),
+            value_bits=_get_int(kv_quant_section, "value_bits", 2),
+            residual_window=_get_int(kv_quant_section, "residual_window", 128),
+            protected_layers=_get_int(kv_quant_section, "protected_layers", 4),
+            protected_bits=_get_int(kv_quant_section, "protected_bits", 8),
+        )
+
     runtime = RuntimeConfig(
         page_size=page_size,
         max_batch_size=max_batch_size,
         max_seq_len=_get_int(runtime_section, "max_seq_len", 4096),
         device=_get_str(runtime_section, "device", "cpu"),
         kv_dtype=_get_str(runtime_section, "kv_dtype", "bfloat16"),
-        weight_dtype=_get_str(runtime_section, "weight_dtype", "float32"),
+        weight_dtype=_get_str(runtime_section, "weight_dtype", "bfloat16"),
         total_kv_pages=_get_optional_int(runtime_section, "total_kv_pages"),
         max_new_tokens=generation.max_new_tokens,
+        kv_quant_config=kv_quant_config,
     )
 
     npu = NpuCliConfig(

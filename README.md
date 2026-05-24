@@ -45,32 +45,36 @@ Show CLI help:
 python -m python.cli --help
 ```
 
-## NPU Generation
+## Offline Mode
 
-One-shot generation, non-L3 path:
-
-```bash
-python examples/model/qwen3_14b/npu_generate.py \
-  --model-dir /data/linyifan/models/Qwen3-14B \
-  --prompt 'Huawei is' \
-  --platform a2a3 \
-  --max-seq-len 512 \
-  --max-new-tokens 5
-```
-
-One-shot generation, L3 path:
+### One-shot Generation
 
 ```bash
-python examples/model/qwen3_14b/npu_generate.py \
-  --model-dir /data/linyifan/models/Qwen3-14B \
-  --prompt 'Huawei is' \
-  --platform a2a3 \
-  --max-seq-len 512 \
-  --max-new-tokens 5 \
-  --l3
+# non-L3 path
+task-submit --device auto --max-time 0 --run \
+  "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
+  python examples/model/qwen3_14b/npu_generate.py \
+    --model-dir /data/linyifan/models/Qwen3-14B \
+    --prompt 'Huawei is' \
+    --platform a2a3 \
+    --max-seq-len 512 \
+    --max-new-tokens 5"
 ```
 
-Interactive generation:
+```bash
+# L3 path
+task-submit --device auto --max-time 0 --run \
+  "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
+  python examples/model/qwen3_14b/npu_generate.py \
+    --model-dir /data/linyifan/models/Qwen3-14B \
+    --prompt 'Huawei is' \
+    --platform a2a3 \
+    --max-seq-len 512 \
+    --max-new-tokens 5 \
+    --l3"
+```
+
+### Interactive Generation
 
 ```bash
 ./examples/pypto-serving \
@@ -82,9 +86,33 @@ Interactive generation:
 At the `[user]` prompt, enter a prompt such as `Huawei is`; use `/exit` or
 `/quit` to leave the interactive session.
 
-## HTTP Serving (OpenAI-compatible API)
+### Enabling TurboQuant (Offline)
 
-Start the serving server with multiprocess worker:
+```bash
+task-submit --device auto --max-time 0 --run \
+  "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
+  python examples/model/qwen3_14b/npu_generate.py \
+    --model-dir /data/linyifan/models/Qwen3-14B \
+    --prompt 'Huawei is' \
+    --platform a2a3 \
+    --max-seq-len 512 \
+    --max-new-tokens 5 \
+    --kv-quant"
+```
+
+Customizable TurboQuant parameters:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--kv-quant-key-bits` | 4 | Key quantization bits |
+| `--kv-quant-value-bits` | 2 | Value quantization bits |
+| `--kv-quant-residual-window` | 128 | Residual quantization window size |
+| `--kv-quant-protected-layers` | 4 | Number of protected (unquantized) layers from the bottom |
+| `--kv-quant-protected-bits` | 8 | Bit width for protected layers |
+
+## Online Mode (HTTP Serving)
+
+### Start the Server (OpenAI-compatible API)
 
 ```bash
 python -m python.cli.main \
@@ -92,7 +120,7 @@ python -m python.cli.main \
   --serve --port 8899 --device {}
 ```
 
-Test with curl:
+### Test Requests
 
 ```bash
 # Health check
@@ -114,11 +142,41 @@ curl http://localhost:8899/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
 ```
 
-Run the serving benchmark:
+### Benchmark
 
 ```bash
 python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
 ```
+
+### Enabling TurboQuant (Online)
+
+Add a `kv_quant` section to your config JSON (same as offline mode):
+
+```json
+{
+  "model": { ... },
+  "runtime": { ... },
+  "kv_quant": {
+    "enabled": true,
+    "key_bits": 4,
+    "value_bits": 2,
+    "residual_window": 128
+  }
+}
+```
+
+When enabled, `[TurboQuant]` log lines will appear in the worker output,
+indicating KV cache compression is active.
+
+## Common CLI Flags
+
+| Flag | Description |
+|---|---|
+| `--device <id>` | Override NPU device ID from config |
+| `--max-num-running-reqs <n>` | Max concurrent running requests |
+| `--long-prefill-token-threshold <n>` | Token threshold for chunked prefill |
+| `--disable-prefix-cache` | Disable prefix caching |
+| `--disable-chunk-prefill` | Disable chunked prefill |
 
 ## Notes
 

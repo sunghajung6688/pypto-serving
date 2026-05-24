@@ -227,6 +227,14 @@ class WorkerProcess:
             ),
         )
 
+        # Correct tokens_used to reflect the full context length.
+        # The runner's run_prefill sets tokens_used based on the current chunk's
+        # seq_len, which doesn't account for prefix-cached or previously computed
+        # tokens. TurboQuant's compress_old_tokens needs the accurate total.
+        for i, sr in enumerate(scheduled):
+            full_computed = sr.num_computed_tokens + sr.num_new_tokens
+            allocations[i].tokens_used = max(allocations[i].tokens_used, full_computed)
+
         for i, sr in enumerate(scheduled):
             request = sr.request
             will_be_computed = sr.num_computed_tokens + sr.num_new_tokens
@@ -301,6 +309,8 @@ class WorkerProcess:
             )
             token_id = self.sampler.sample(logits, params)
             new_tokens[request.request_id] = token_id
+
+
 
 
 def _worker_entry(
