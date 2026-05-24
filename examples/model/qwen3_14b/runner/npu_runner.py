@@ -101,6 +101,9 @@ class _CompiledKernels:
     l3_generate_platform: str | None = None
     l3_generate_runtime_name: str | None = None
     l3_generate_param_infos: object | None = None
+    # TurboQuant KV cache compression kernels. None when kv_quant is disabled.
+    tq_compress: _L2Callable | None = None
+    tq_decompress: _L2Callable | None = None
 
 
 @dataclass
@@ -159,6 +162,68 @@ class Qwen314BModelRunner(ModelRunner):
         self._l2_child_allocs: dict[tuple[str, int], tuple[int, int]] = {}
         self._l2_dirty_kv_models: set[str] = set()
 
+    def run_tq_compress(self, flat_kv, rot_matrix, lo, inv_step, n_levels_m1):
+        """Run TurboQuant compress NPU kernel: normalize + rotate + uniform quantize."""
+        import torch
+
+        compiled = self._compiled
+        if compiled.tq_compress is not None:
+            # NPU kernel path
+            n = flat_kv.shape[0]
+            d = flat_kv.shape[1]
+            indices_out = torch.zeros(n, d, dtype=torch.uint8, device="cpu")
+            norms_out = torch.zeros(n, 1, dtype=torch.float16, device="cpu")
+
+            self._run_l2_program(
+                compiled.tq_compress,
+                flat_kv.contiguous().cpu(),
+                self._l2_child_tensor(compiled.tq_compress.runtime_name, rot_matrix),
+                ctypes.c_float(lo),
+                ctypes.c_float(inv_step),
+                ctypes.c_int(n_levels_m1),
+                indices_out,
+                norms_out,
+            )
+            return indices_out, norms_out
+
+        # Fallback: pure PyTorch
+        x = flat_kv.float()
+        norms = torch.norm(x, dim=-1)
+        x_normed = x / (norms.unsqueeze(-1) + 1e-8)
+        rotated = x_normed @ rot_matrix.float()
+        shifted = rotated - lo
+        scaled = shifted * inv_step
+        indices = torch.clamp(torch.floor(scaled).long(), 0, n_levels_m1).to(torch.uint8)
+        return indices, norms.to(torch.float16).unsqueeze(-1)  # [N, 1]
+
+    def run_tq_decompress(self, centroid_vals, rot_matrix, norms):
+        """Run TurboQuant decompress NPU kernel: inverse rotation + scale by norms."""
+        import torch
+
+        compiled = self._compiled
+        if compiled.tq_decompress is not None:
+            # NPU kernel path
+            n = centroid_vals.shape[0]
+            d = centroid_vals.shape[1]
+            reconstructed_out = torch.zeros(n, d, dtype=torch.bfloat16, device="cpu")
+
+            self._run_l2_program(
+                compiled.tq_decompress,
+                centroid_vals.contiguous().cpu(),
+                self._l2_child_tensor(compiled.tq_decompress.runtime_name, rot_matrix),
+                norms.contiguous().cpu(),
+                reconstructed_out,
+            )
+            return reconstructed_out
+
+        # Fallback: pure PyTorch
+        cv = centroid_vals.float()
+        pi = rot_matrix.float()
+        n = norms.float().squeeze(-1)  # [N] from [N, 1]
+        rotated = cv @ pi
+        reconstructed = (rotated * n.unsqueeze(-1)).to(torch.bfloat16)
+        return reconstructed
+
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Run layer-by-layer prompt prefill and project next-token logits."""
         compiled = self._compiled
@@ -215,6 +280,14 @@ class Qwen314BModelRunner(ModelRunner):
             last_hidden_rows.append(hidden[batch_idx, seq_len - 1].float())
         last_hidden = torch.stack(last_hidden_rows)
         logits = self._project_logits(model, last_hidden)
+
+        # ── KV quantization: compress old tokens after prefill ──
+        model_id = model.config.model_id
+        if self._kv_cache_manager.is_quantization_enabled(model_id):
+            print(f"[TurboQuant] run_prefill: compressing old tokens after prefill", flush=True)
+            for alloc in batch.kv_allocations:
+                self._kv_cache_manager.compress_old_tokens(model_id, alloc, npu_runner=self)
+
         return PrefillResult(last_hidden=last_hidden, logits=logits)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
@@ -225,9 +298,18 @@ class Qwen314BModelRunner(ModelRunner):
         # buffer. Argument order mirrors the kernel signature in
         # build_qwen3_decode_program.qwen3_decode.
         compiled = self._compiled
+        dw = compiled.decode_weights
+        model_id = model.config.model_id
+
+        # ── KV quantization: restore compressed old tokens BEFORE building
+        # block_table so that workspace pages are included in page_ids. ──
+        if self._kv_cache_manager.is_quantization_enabled(model_id):
+            print(f"[TurboQuant] run_decode: restoring compressed tokens before kernel", flush=True)
+            for alloc in batch.kv_allocations:
+                self._kv_cache_manager.restore_compressed_tokens(model_id, alloc, npu_runner=self)
+
         decode_inputs = self._prepare_decode_inputs(model, batch)
         hidden = decode_inputs.hidden
-        dw = compiled.decode_weights
 
         k_cache, v_cache = self._kv_cache_manager.materialize_full_layer_cache(
             model.config.model_id,
@@ -290,6 +372,13 @@ class Qwen314BModelRunner(ModelRunner):
         logits = self._project_logits(model, final_hidden)
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
+
+        # ── KV quantization: compress old tokens after kernel ──
+        if self._kv_cache_manager.is_quantization_enabled(model_id):
+            print(f"[TurboQuant] run_decode: compressing old tokens after kernel", flush=True)
+            for alloc in batch.kv_allocations:
+                self._kv_cache_manager.compress_old_tokens(model_id, alloc, npu_runner=self)
+
         return DecodeResult(hidden_states=final_hidden, logits=logits)
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:

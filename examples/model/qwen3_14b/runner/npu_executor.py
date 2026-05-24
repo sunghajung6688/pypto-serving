@@ -365,6 +365,37 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         lm_head = self._compile_l2_callable("lm_head", lm_head_program)
         _mark("compile_final_rms_lm_head")
 
+        # TurboQuant KV cache compression kernels (compiled only when kv_quant enabled).
+        tq_compress: _L2Callable | None = None
+        tq_decompress: _L2Callable | None = None
+        pool = self._kv_cache_manager._pools.get(model.config.model_id)
+        if pool is not None and pool.kv_quant_config is not None and pool.kv_quant_config.enabled:
+            import ctypes  # noqa: PLC0415
+            qwen3_tq_compress = _load_pypto_lib_qwen14b_module("turboquant_compress")
+            qwen3_tq_decompress = _load_pypto_lib_qwen14b_module("turboquant_decompress")
+
+            # Build dummy args matching the @pl.jit function signatures.
+            _n = 128  # dummy vector count for compilation
+            _d = model.config.head_dim
+            _kv_dummy = torch.zeros(_n, _d, dtype=torch.bfloat16, device="cpu")
+            _rot_dummy = torch.zeros(_d, _d, dtype=torch.bfloat16, device="cpu")
+            _norms_dummy = torch.zeros(_n, 1, dtype=torch.float16, device="cpu")
+            _indices_dummy = torch.zeros(_n, _d, dtype=torch.uint8, device="cpu")
+            _recon_dummy = torch.zeros(_n, _d, dtype=torch.bfloat16, device="cpu")
+
+            tq_compress = self._compile_l2_callable_from_jit(
+                "tq_compress",
+                qwen3_tq_compress.tq_compress_test,
+                (_kv_dummy, _rot_dummy, ctypes.c_float(-0.01), ctypes.c_float(100.0),
+                 ctypes.c_int(15), _indices_dummy, _norms_dummy),
+            )
+            tq_decompress = self._compile_l2_callable_from_jit(
+                "tq_decompress",
+                qwen3_tq_decompress.tq_decompress_test,
+                (_kv_dummy, _rot_dummy, _norms_dummy, _recon_dummy),
+            )
+        _mark("compile_turboquant")
+
         rope_cos_raw, rope_sin_raw = rope_tables(
             model.runtime.max_seq_len,
             model.config.head_dim,
@@ -542,6 +573,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             l3_generate_platform=l3_generate_platform,
             l3_generate_runtime_name=l3_generate_runtime_name,
             l3_generate_param_infos=l3_generate_param_infos,
+            tq_compress=tq_compress,
+            tq_decompress=tq_decompress,
         )
 
     def _compile_l2_callable(self, name: str, program: object) -> _L2Callable:
@@ -570,6 +603,72 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         runtime_config = runtime_config or {}
         compiled_view = CompiledProgram(
             program,
+            str(work_dir),
+            backend_type=config.backend_type,
+            platform=self._platform,
+        )
+        param_infos, _, _ = compiled_view._get_metadata()
+        return _L2Callable(
+            chip_callable=chip_callable,
+            runtime_name=runtime_name,
+            block_dim=int(runtime_config.get("block_dim", 24)),
+            aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
+            param_infos=tuple(param_infos),
+        )
+
+    def _compile_l2_callable_from_jit(self, name: str, jit_fn, dummy_args: tuple) -> _L2Callable:
+        """Compile a ``@pl.jit`` function into a Simpler callable.
+
+        Uses the JIT compilation path (``fn._compile``) which supports
+        ``@pl.jit.inline`` helpers and scalar operations, unlike
+        ``compile_program()`` which requires ``@pl.program`` classes.
+        """
+        from pypto.jit.cache import make_cache_key  # noqa: PLC0415
+        from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+        import pypto.language as pl_mod  # noqa: PLC0415
+
+        config = self._run_config(codegen_only=True)
+        work_dir = self._l2_work_dir(name)
+
+        # Bind dummy args to trigger JIT compilation.
+        param_names, _arguments, tensor_meta, scalar_values, scalar_dtypes, dynamic_dims = (
+            jit_fn._bind_args(dummy_args, {})
+        )
+        key = make_cache_key(
+            source_hash=jit_fn._get_source_hash(),
+            param_names=param_names,
+            tensor_shapes={n: m.shape for n, m in tensor_meta.items()},
+            tensor_dtypes={n: m.dtype for n, m in tensor_meta.items()},
+            dynamic_dims=dynamic_dims,
+            scalar_values=scalar_values,
+            platform=self._platform,
+        )
+        if key not in jit_fn._cache:
+            jit_fn._cache[key] = jit_fn._compile(
+                tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl_mod,
+                platform=self._platform,
+                dump_passes=config.dump_passes,
+                diagnostic_phase=config.diagnostic_phase,
+            )
+        jit_output_dir = Path(jit_fn._cache[key].output_dir)
+
+        # Copy JIT output to our work_dir so compile_and_assemble finds it.
+        import shutil  # noqa: PLC0415
+        if work_dir.exists():
+            shutil.rmtree(work_dir)
+        shutil.copytree(jit_output_dir, work_dir)
+
+        chip_callable, runtime_name, runtime_config = compile_and_assemble(
+            work_dir,
+            self._platform,
+            pto_isa_commit=config.pto_isa_commit,
+        )
+        runtime_config = runtime_config or {}
+
+        # Build param_infos from the JIT compiled artifacts.
+        from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
+        compiled_view = CompiledProgram(
+            jit_fn,
             str(work_dir),
             backend_type=config.backend_type,
             platform=self._platform,

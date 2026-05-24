@@ -239,6 +239,14 @@ class WorkerProcess:
             ),
         )
 
+        # Correct tokens_used to reflect the full context length.
+        # The runner's run_prefill sets tokens_used based on the current chunk's
+        # seq_len, which doesn't account for prefix-cached or previously computed
+        # tokens. TurboQuant's compress_old_tokens needs the accurate total.
+        for i, sr in enumerate(scheduled):
+            full_computed = sr.num_computed_tokens + sr.num_new_tokens
+            allocations[i].tokens_used = max(allocations[i].tokens_used, full_computed)
+
         for i, sr in enumerate(scheduled):
             request = sr.request
             will_be_computed = sr.num_computed_tokens + sr.num_new_tokens
@@ -332,6 +340,10 @@ class WorkerProcess:
         req_id = request.request_id
         if req_id in self._allocations:
             alloc = self._allocations[req_id]
+            # Clear stale compressed segments from before preemption
+            self.kv_cache_manager.clear_compressed_segments(
+                self.config.model_id, req_id
+            )
             alloc.page_ids = list(block_ids)
             alloc.tokens_capacity = len(block_ids) * self.kv_cache_manager._pool(
                 self.config.model_id
@@ -346,7 +358,11 @@ class WorkerProcess:
 
     def free_allocation(self, request_id: str) -> None:
         """Drop KV allocation reference. Block lifecycle is managed by the scheduler."""
-        self._allocations.pop(request_id, None)
+        alloc = self._allocations.pop(request_id, None)
+        if alloc is not None:
+            self.kv_cache_manager.clear_compressed_segments(
+                self.config.model_id, request_id
+            )
 
 
 def _worker_entry(
