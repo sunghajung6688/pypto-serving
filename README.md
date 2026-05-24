@@ -45,11 +45,12 @@ Show CLI help:
 python -m python.cli --help
 ```
 
-## NPU Generation
+## Offline Mode
 
-One-shot generation, non-L3 path:
+### One-shot Generation
 
 ```bash
+# non-L3 path
 task-submit --device auto --max-time 0 --run \
   "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
   python examples/model/qwen3_14b/npu_generate.py \
@@ -60,9 +61,8 @@ task-submit --device auto --max-time 0 --run \
     --max-new-tokens 5"
 ```
 
-One-shot generation, L3 path:
-
 ```bash
+# L3 path
 task-submit --device auto --max-time 0 --run \
   "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
   python examples/model/qwen3_14b/npu_generate.py \
@@ -74,7 +74,7 @@ task-submit --device auto --max-time 0 --run \
     --l3"
 ```
 
-Interactive generation:
+### Interactive Generation
 
 ```bash
 task-submit --run -i \
@@ -87,9 +87,26 @@ task-submit --run -i \
 At the `[user]` prompt, enter a prompt such as `Huawei is`; use `/exit` or
 `/quit` to leave the interactive session.
 
-## HTTP Serving (OpenAI-compatible API)
+### Enabling TurboQuant (Offline)
 
-Start the serving server with multiprocess worker:
+Add a `kv_quant` section to your config JSON:
+
+```json
+{
+  "model": { ... },
+  "runtime": { ... },
+  "kv_quant": {
+    "enabled": true,
+    "key_bits": 4,
+    "value_bits": 2,
+    "residual_window": 128
+  }
+}
+```
+
+## Online Mode (HTTP Serving)
+
+### Start the Server (OpenAI-compatible API)
 
 ```bash
 task-submit --device auto --max-time 0 --run \
@@ -98,7 +115,7 @@ task-submit --device auto --max-time 0 --run \
     --serve --port 8899 --device {}"
 ```
 
-Test with curl:
+### Test Requests
 
 ```bash
 # Health check
@@ -120,11 +137,41 @@ curl http://localhost:8899/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
 ```
 
-Run the serving benchmark:
+### Benchmark
 
 ```bash
 python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
 ```
+
+### Enabling TurboQuant (Online)
+
+Add a `kv_quant` section to your config JSON (same as offline mode):
+
+```json
+{
+  "model": { ... },
+  "runtime": { ... },
+  "kv_quant": {
+    "enabled": true,
+    "key_bits": 4,
+    "value_bits": 2,
+    "residual_window": 128
+  }
+}
+```
+
+When enabled, `[TurboQuant]` log lines will appear in the worker output,
+indicating KV cache compression is active.
+
+## Common CLI Flags
+
+| Flag | Description |
+|---|---|
+| `--device <id>` | Override NPU device ID from config |
+| `--max-num-running-reqs <n>` | Max concurrent running requests |
+| `--long-prefill-token-threshold <n>` | Token threshold for chunked prefill |
+| `--disable-prefix-cache` | Disable prefix caching |
+| `--disable-chunk-prefill` | Disable chunked prefill |
 
 ## Notes
 

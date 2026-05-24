@@ -215,6 +215,14 @@ class Qwen314BModelRunner(ModelRunner):
             last_hidden_rows.append(hidden[batch_idx, seq_len - 1].float())
         last_hidden = torch.stack(last_hidden_rows)
         logits = self._project_logits(model, last_hidden)
+
+        # ── KV quantization: compress old tokens after prefill ──
+        model_id = model.config.model_id
+        if self._kv_cache_manager.is_quantization_enabled(model_id):
+            print(f"[TurboQuant] run_prefill: compressing old tokens after prefill", flush=True)
+            for alloc in batch.kv_allocations:
+                self._kv_cache_manager.compress_old_tokens(model_id, alloc)
+
         return PrefillResult(last_hidden=last_hidden, logits=logits)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
@@ -228,6 +236,13 @@ class Qwen314BModelRunner(ModelRunner):
         decode_inputs = self._prepare_decode_inputs(model, batch)
         hidden = decode_inputs.hidden
         dw = compiled.decode_weights
+
+        # ── KV quantization: restore compressed old tokens before kernel ──
+        model_id = model.config.model_id
+        if self._kv_cache_manager.is_quantization_enabled(model_id):
+            print(f"[TurboQuant] run_decode: restoring compressed tokens before kernel", flush=True)
+            for alloc in batch.kv_allocations:
+                self._kv_cache_manager.restore_compressed_tokens(model_id, alloc)
 
         k_cache, v_cache = self._kv_cache_manager.materialize_full_layer_cache(
             model.config.model_id,
@@ -290,6 +305,13 @@ class Qwen314BModelRunner(ModelRunner):
         logits = self._project_logits(model, final_hidden)
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
+
+        # ── KV quantization: compress old tokens after kernel ──
+        if self._kv_cache_manager.is_quantization_enabled(model_id):
+            print(f"[TurboQuant] run_decode: compressing old tokens after kernel", flush=True)
+            for alloc in batch.kv_allocations:
+                self._kv_cache_manager.compress_old_tokens(model_id, alloc)
+
         return DecodeResult(hidden_states=final_hidden, logits=logits)
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
