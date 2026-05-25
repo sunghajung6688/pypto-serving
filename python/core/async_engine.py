@@ -77,23 +77,8 @@ class AsyncLLMEngine:
         self.bos_token_id = bos_token_id
         self._in_process = in_process
 
-        num_blocks = self.config.num_blocks or (
-            self.config.max_num_running_reqs
-            * (self.config.max_seq_len // self.config.block_size + 1)
-        )
-        self.block_pool = BlockPool(
-            num_blocks=num_blocks, block_size=self.config.block_size
-        )
-
-        scheduler_config = SchedulerConfig(
-            max_num_running_reqs=self.config.max_num_running_reqs,
-            max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
-            long_prefill_token_threshold=self.config.long_prefill_token_threshold,
-            max_seq_len=self.config.max_seq_len,
-            enable_prefix_cache=self.config.enable_prefix_cache,
-            enable_chunk_prefill=self.config.enable_chunk_prefill,
-        )
-        self.scheduler = Scheduler(config=scheduler_config, block_pool=self.block_pool)
+        self.block_pool = None  # created in start() after worker reports num_blocks
+        self.scheduler = None  # created in start() alongside block_pool
 
         self._request_contexts: dict[str, _RequestContext] = {}
         self._running = False
@@ -110,6 +95,8 @@ class AsyncLLMEngine:
         import queue
         import threading
 
+        num_blocks_from_worker = 0
+
         if self._in_process:
             self._input_queue = queue.Queue()
             self._output_queue = queue.Queue()
@@ -117,13 +104,17 @@ class AsyncLLMEngine:
                 self.worker_config, self._input_queue, self._output_queue
             )
             worker.init_device_and_model()
+            # Read num_blocks from worker's kv cache manager
+            model_id = self.worker_config.model_id
+            if model_id in worker.kv_cache_manager._pools:
+                num_blocks_from_worker = len(worker.kv_cache_manager._pools[model_id].free_pages)
             self._worker_thread = threading.Thread(
                 target=worker.busy_loop, daemon=True
             )
             self._worker_thread.start()
             logger.info("Worker started in-process (thread mode)")
         else:
-            process, input_q, output_q, ready_event = spawn_worker(self.worker_config)
+            process, input_q, output_q, ready_event, num_blocks_value = spawn_worker(self.worker_config)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
@@ -132,7 +123,36 @@ class AsyncLLMEngine:
             await asyncio.to_thread(ready_event.wait, timeout=600)
             if not ready_event.is_set():
                 raise RuntimeError("Worker failed to initialize within timeout")
+            num_blocks_from_worker = num_blocks_value.value
             logger.info("Worker ready")
+
+        # Create BlockPool and Scheduler with dynamically computed num_blocks
+        final_num_blocks = self.config.num_blocks or num_blocks_from_worker
+        if not final_num_blocks:
+            final_num_blocks = (
+                self.config.max_num_running_reqs
+                * (self.config.max_seq_len // self.config.block_size + 1)
+            )
+        logger.info(
+            "BlockPool: num_blocks=%d (config=%s, worker=%d, static_fallback=%d)",
+            final_num_blocks,
+            self.config.num_blocks,
+            num_blocks_from_worker,
+            self.config.max_num_running_reqs
+            * (self.config.max_seq_len // self.config.block_size + 1),
+        )
+        self.block_pool = BlockPool(
+            num_blocks=final_num_blocks, block_size=self.config.block_size
+        )
+        scheduler_config = SchedulerConfig(
+            max_num_running_reqs=self.config.max_num_running_reqs,
+            max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
+            long_prefill_token_threshold=self.config.long_prefill_token_threshold,
+            max_seq_len=self.config.max_seq_len,
+            enable_prefix_cache=self.config.enable_prefix_cache,
+            enable_chunk_prefill=self.config.enable_chunk_prefill,
+        )
+        self.scheduler = Scheduler(config=scheduler_config, block_pool=self.block_pool)
 
         self._running = True
         self._loop_task = asyncio.create_task(self._engine_loop())

@@ -370,11 +370,21 @@ def _worker_entry(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
     ready_event,
+    num_blocks_value=None,
 ):
     """Entry point for the worker subprocess."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     worker = WorkerProcess(config, input_queue, output_queue)
     try:
         worker.init_device_and_model()
+        # Report computed num_blocks to main process
+        if num_blocks_value is not None:
+            model_id = config.model_id
+            pool = worker.kv_cache_manager._pools[model_id]
+            num_blocks_value.value = len(pool.free_pages)
         ready_event.set()
         worker.busy_loop()
     except Exception as e:
@@ -382,17 +392,18 @@ def _worker_entry(
         ready_event.set()
 
 
-def spawn_worker(config: WorkerConfig) -> tuple[mp.Process, mp.Queue, mp.Queue, mp.Event]:
-    """Spawn a worker process and return (process, input_queue, output_queue, ready_event)."""
+def spawn_worker(config: WorkerConfig) -> tuple[mp.Process, mp.Queue, mp.Queue, mp.Event, mp.Value]:
+    """Spawn a worker process and return (process, input_queue, output_queue, ready_event, num_blocks_value)."""
     ctx = mp.get_context("spawn")
     input_queue = ctx.Queue()
     output_queue = ctx.Queue()
     ready_event = ctx.Event()
+    num_blocks_value = ctx.Value("i", 0)
 
     process = ctx.Process(
         target=_worker_entry,
-        args=(config, input_queue, output_queue, ready_event),
+        args=(config, input_queue, output_queue, ready_event, num_blocks_value),
         daemon=False,
     )
     process.start()
-    return process, input_queue, output_queue, ready_event
+    return process, input_queue, output_queue, ready_event, num_blocks_value

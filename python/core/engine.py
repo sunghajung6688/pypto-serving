@@ -10,9 +10,12 @@
 from __future__ import annotations
 
 import itertools
+import logging
 from collections.abc import Iterator
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from ._profiling import StageTimer
 from .executor import ModelExecutor
@@ -80,8 +83,8 @@ class LLMEngine:
         timer.mark("model_loader.load")
         config = loaded.config
         runtime = loaded.runtime_model.runtime
-        self._kv_cache_manager.register_model(model_id, config, runtime)
-        timer.mark("kv_cache_manager.register")
+
+        # Phase 2: Create model record and notify executor (needed before profiling)
         self._models[model_id] = ModelRecord(
             config=config,
             runtime=runtime,
@@ -94,6 +97,37 @@ class LLMEngine:
         if callable(register_model):
             register_model(model_id, self._models[model_id])
         timer.mark("executor.register_model")
+
+        # Phase 3: Profile peak memory via dummy forward pass
+        peak_memory = self._executor.profile_peak_memory(
+            loaded.runtime_model, self._kv_cache_manager,
+            model_id, config, runtime,
+        )
+        timer.mark("profile_peak_memory")
+
+        # Log weight memory vs peak memory for comparison
+        device = runtime.device
+        weight_mem = 0
+        try:
+            if device.startswith("npu"):
+                weight_mem = torch.npu.memory_allocated(device)
+            elif device.startswith("cuda"):
+                weight_mem = torch.cuda.memory_allocated(device)
+        except (AttributeError, RuntimeError):
+            pass
+        if peak_memory > 0:
+            logger.info(
+                "[Memory] weight_only=%.2f GiB, peak(weight+activation)=%.2f GiB, "
+                "activation_overhead=%.2f GiB",
+                weight_mem / (1024 ** 3), peak_memory / (1024 ** 3),
+                (peak_memory - weight_mem) / (1024 ** 3),
+            )
+
+        # Phase 4: Allocate KV cache with profiled peak memory
+        self._kv_cache_manager.register_model(
+            model_id, config, runtime, peak_memory_bytes=peak_memory,
+        )
+        timer.mark("kv_cache_manager.register")
 
         timer.report()
 

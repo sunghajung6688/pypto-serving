@@ -9,10 +9,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from .types import KvAllocation, ModelConfig, RuntimeConfig
 
@@ -36,6 +39,55 @@ class _CompressedSegment:
     token_count: int
     compressed_k: dict
     compressed_v: dict
+
+
+def compute_num_kv_pages(
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    kv_dtype: torch.dtype,
+    device: str,
+    gpu_memory_utilization: float = 0.9,
+    peak_memory_bytes: int = 0,
+) -> int:
+    """Calculate the number of KV cache pages that fit in available device memory.
+
+    Uses peak_memory_bytes (from dummy forward pass profiling) to account for
+    both weight memory and activation memory.
+
+    Raises RuntimeError if the device is not supported or memory info is unavailable.
+    """
+    if device.startswith("npu"):
+        _, total_mem = torch.npu.mem_get_info(device)
+    elif device.startswith("cuda"):
+        _, total_mem = torch.cuda.mem_get_info(device)
+    else:
+        raise RuntimeError(
+            f"Cannot compute KV cache pages for device '{device}'. "
+            f"Set total_kv_pages explicitly in the config."
+        )
+
+    target = int(total_mem * gpu_memory_utilization)
+    available = target - peak_memory_bytes
+    if available <= 0:
+        raise RuntimeError(
+            f"Not enough device memory for KV cache: "
+            f"target={target / 1024**3:.2f} GiB, "
+            f"peak_memory={peak_memory_bytes / 1024**3:.2f} GiB, "
+            f"available={available / 1024**3:.2f} GiB. "
+            f"Reduce gpu_memory_utilization or set total_kv_pages explicitly."
+        )
+
+    dtype_size = torch.tensor([], dtype=kv_dtype).element_size()
+    page_size_bytes = 2 * page_size * num_kv_heads * head_dim * dtype_size
+    num_pages = max(available // (page_size_bytes * num_layers), 0)
+    if num_pages == 0:
+        raise RuntimeError(
+            f"Available memory ({available / 1024**3:.2f} GiB) is too small "
+            f"for even one KV cache page ({page_size_bytes * num_layers / 1024**2:.2f} MiB/page)."
+        )
+    return num_pages
 
 
 @dataclass
@@ -64,15 +116,36 @@ class KvCacheManager:
         """Create an empty registry of model-specific KV pools."""
         self._pools: dict[str, _CachePool] = {}
 
-    def register_model(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> None:
+    def register_model(
+        self,
+        model_id: str,
+        config: ModelConfig,
+        runtime: RuntimeConfig,
+        peak_memory_bytes: int = 0,
+    ) -> None:
         """Create the KV page pool for a model if it is not already registered."""
         if model_id in self._pools:
             return
         max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
+        kv_dtype = getattr(torch, runtime.kv_dtype)
         num_pages = runtime.total_kv_pages
         if num_pages is None:
-            num_pages = runtime.max_batch_size * max_blocks_per_seq
-        kv_dtype = getattr(torch, runtime.kv_dtype)
+            num_pages = compute_num_kv_pages(
+                num_layers=config.num_hidden_layers,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                page_size=runtime.page_size,
+                kv_dtype=kv_dtype,
+                device=runtime.device,
+                gpu_memory_utilization=runtime.gpu_memory_utilization,
+                peak_memory_bytes=peak_memory_bytes,
+            )
+            logger.info(
+                "[KV Cache] Dynamic allocation from profiled peak memory: %d pages "
+                "(peak_memory=%.2f GiB, gpu_memory_utilization=%.2f)",
+                num_pages, peak_memory_bytes / (1024 ** 3),
+                runtime.gpu_memory_utilization,
+            )
         key_pages = torch.zeros(
             config.num_hidden_layers,
             num_pages,
@@ -112,6 +185,19 @@ class KvCacheManager:
             kv_quant_config=kv_quant_config,
             compressed_segments=compressed_segments,
         )
+
+        kv_bytes = key_pages.numel() * key_pages.element_size() * 2  # key + value
+        per_page_bytes = 2 * config.num_key_value_heads * runtime.page_size * config.head_dim * key_pages.element_size()
+        logger.info(
+            "[KV Cache] Allocated KV cache: %d pages, %.2f GiB "
+            "(per_page=%d bytes, %d layers)",
+            num_pages, kv_bytes / (1024 ** 3),
+            per_page_bytes, config.num_hidden_layers,
+        )
+
+    def unregister_model(self, model_id: str) -> None:
+        """Remove a model's KV pool. Used for cleaning up profiling pools."""
+        self._pools.pop(model_id, None)
 
     def allocate_for_prompt(self, model_id: str, request_id: str, prompt_len: int) -> KvAllocation:
         """Allocate enough KV pages to store a prompt of ``prompt_len`` tokens."""

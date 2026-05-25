@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import logging
 from abc import ABC, abstractmethod
 
 import torch
@@ -20,12 +22,17 @@ from .types import (
     DecodeResult,
     GenerateConfig,
     GenerateResult,
+    KvAllocation,
+    ModelConfig,
     ModelRecord,
     PrefillBatch,
     PrefillResult,
     RequestState,
+    RuntimeConfig,
     RuntimeModel,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ModelExecutor(ABC):
@@ -52,6 +59,104 @@ class ModelExecutor(ABC):
             *token_ids.shape,
             model.config.hidden_size,
         )
+
+    def profile_peak_memory(
+        self,
+        model: RuntimeModel,
+        kv_cache_manager: KvCacheManager,
+        model_id: str,
+        config: ModelConfig,
+        runtime: RuntimeConfig,
+    ) -> int:
+        """Run a dummy forward pass and return peak device memory in bytes.
+
+        Raises RuntimeError if profiling is not supported (CPU device, etc.).
+        """
+        device = runtime.device
+        if not (device.startswith("npu") or device.startswith("cuda")):
+            raise RuntimeError(
+                f"Cannot profile peak memory for device '{device}'. "
+                f"Profiling requires an NPU or CUDA device. "
+                f"Set total_kv_pages explicitly in the config to skip profiling."
+            )
+
+        # Reset peak memory stats
+        self._reset_peak_memory(device)
+
+        # Allocate a temporary minimal KV pool for profiling (no TurboQuant)
+        kv_cache_manager.register_model(model_id, config, dataclasses.replace(
+            runtime, total_kv_pages=1, kv_quant_config=None,
+        ))
+
+        try:
+            batch_size = 1
+            seq_len = runtime.page_size
+            device_obj = torch.device(device)
+
+            dummy_tokens = torch.zeros(
+                (batch_size, seq_len), dtype=torch.long, device=device_obj,
+            )
+            dummy_embeddings = torch.zeros(
+                (batch_size, seq_len, config.hidden_size),
+                dtype=model.embed_tokens.dtype, device=device_obj,
+            )
+
+            pool = kv_cache_manager._pool(model_id)
+            dummy_alloc = KvAllocation(
+                request_id="__profile__",
+                model_id=model_id,
+                page_ids=[0],
+                tokens_capacity=pool.page_size,
+                tokens_used=0,
+            )
+
+            block_table = torch.tensor(
+                [[0]], dtype=torch.int32, device=device_obj,
+            )
+            slot_mapping = torch.arange(
+                seq_len, dtype=torch.int32, device=device_obj,
+            ).unsqueeze(0)
+
+            with self.session():
+                self.run_prefill(model, PrefillBatch(
+                    request_ids=["__profile__"],
+                    token_ids=dummy_tokens,
+                    input_embeddings=dummy_embeddings,
+                    seq_lens=torch.tensor(
+                        [seq_len], dtype=torch.int32, device=device_obj,
+                    ),
+                    kv_allocations=[dummy_alloc],
+                    positions=dummy_tokens.clone(),
+                    block_table=block_table,
+                    slot_mapping=slot_mapping,
+                ))
+        finally:
+            # Remove temporary pool
+            kv_cache_manager.unregister_model(model_id)
+
+        peak = self._max_memory_allocated(device)
+        logger.info(
+            "[Profiling] Peak device memory after dummy forward: %.2f GiB "
+            "(device=%s)", peak / (1024 ** 3), device,
+        )
+        return peak
+
+    @staticmethod
+    def _reset_peak_memory(device: str) -> None:
+        """Reset peak memory tracking on the given device."""
+        if device.startswith("npu"):
+            torch.npu.reset_peak_memory_stats(device)
+        elif device.startswith("cuda"):
+            torch.cuda.reset_peak_memory_stats(device)
+
+    @staticmethod
+    def _max_memory_allocated(device: str) -> int:
+        """Return peak memory in bytes allocated on the given device."""
+        if device.startswith("npu"):
+            return torch.npu.max_memory_allocated(device)
+        elif device.startswith("cuda"):
+            return torch.cuda.max_memory_allocated(device)
+        return 0
 
     def validate_generate_batch(
         self,

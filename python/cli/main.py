@@ -190,6 +190,7 @@ def load_serving_config(
         kv_dtype=_get_str(runtime_section, "kv_dtype", "bfloat16"),
         weight_dtype=_get_str(runtime_section, "weight_dtype", "float32"),
         total_kv_pages=_get_optional_int(runtime_section, "total_kv_pages"),
+        gpu_memory_utilization=_get_float(runtime_section, "gpu_memory_utilization", 0.9),
         max_new_tokens=generation.max_new_tokens,
         kv_quant_config=kv_quant_config,
     )
@@ -407,6 +408,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             engine = create_engine(config)
             init_engine(engine, config)
 
+    if not args.serve:
+        _print_offline_summary(engine, config)
+
     if args.serve:
         run_serve(
             config,
@@ -502,6 +506,32 @@ def _print_runtime_summary(config: ServingConfig, stdout: TextIO) -> None:
             f"l3={config.npu.l3_mode}",
             file=stdout,
         )
+    if config.runtime.kv_quant_config is not None and config.runtime.kv_quant_config.enabled:
+        kq = config.runtime.kv_quant_config
+        print(
+            f"TurboQuant: key_bits={kq.key_bits}, val_bits={kq.value_bits}, "
+            f"residual_window={kq.residual_window}, protected_layers={kq.protected_layers}",
+            file=stdout,
+        )
+
+
+def _print_offline_summary(engine: LLMEngine, config: ServingConfig) -> None:
+    """Print model loading summary after startup logs are restored."""
+    model_id = config.model.model_id
+    kv_mgr = engine._kv_cache_manager
+    if model_id in kv_mgr._pools:
+        pool = kv_mgr._pools[model_id]
+        total_pages = pool.key_pages.shape[1]
+        kv_bytes = pool.key_pages.numel() * pool.key_pages.element_size() * 2
+        def _fmt(b: int) -> str:
+            return f"{b / 1024 ** 3:.2f} GiB" if b >= 1024 ** 3 else f"{b / 1024 ** 2:.2f} MiB"
+        print(f"[Init] KV cache: {total_pages} pages, {_fmt(kv_bytes)}", flush=True)
+        if pool.kv_compressor is not None:
+            print(f"[Init] TurboQuant: enabled (key_bits={pool.kv_quant_config.key_bits}, "
+                  f"val_bits={pool.kv_quant_config.value_bits}, "
+                  f"residual_window={pool.kv_quant_config.residual_window})", flush=True)
+        else:
+            print("[Init] TurboQuant: disabled", flush=True)
 
 
 @contextlib.contextmanager

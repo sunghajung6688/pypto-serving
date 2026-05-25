@@ -42,7 +42,7 @@ _bootstrap_package_root()
 from python.core import GenerateConfig, LLMEngine, RuntimeConfig
 from python.core.kv_cache import KvCacheManager
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
-from python.core.types import LoadedModel
+from python.core.types import KvQuantConfig, LoadedModel
 import dataclasses
 
 
@@ -341,6 +341,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Implies --profile. Also dump per-layer prefill times and "
              "per-decode-step layer breakdowns.",
     )
+    parser.add_argument("--kv-quant", action="store_true", help="Enable TurboQuant KV cache compression.")
+    parser.add_argument("--kv-key-bits", type=int, default=4)
+    parser.add_argument("--kv-value-bits", type=int, default=2)
+    parser.add_argument("--kv-residual-window", type=int, default=128)
+    parser.add_argument("--kv-protected-layers", type=int, default=4)
+    parser.add_argument("--kv-protected-bits", type=int, default=8)
     return parser
 
 
@@ -371,6 +377,16 @@ def main() -> None:
         _install_num_layers_override(engine, args.num_layers_override)
 
     init_t0 = time.perf_counter()
+
+    kv_quant_config = KvQuantConfig(
+        enabled=True,
+        key_bits=args.kv_key_bits,
+        value_bits=args.kv_value_bits,
+        residual_window=args.kv_residual_window,
+        protected_layers=args.kv_protected_layers,
+        protected_bits=args.kv_protected_bits,
+    ) if args.kv_quant else None
+
     engine.init_model(
         model_id=args.model_id,
         model_dir=str(model_dir),
@@ -383,6 +399,7 @@ def main() -> None:
             device="cpu",
             kv_dtype="bfloat16",
             weight_dtype="float32",
+            kv_quant_config=kv_quant_config,
         ),
     )
     if collector is not None:

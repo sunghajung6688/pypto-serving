@@ -74,6 +74,7 @@ class RuntimeConfig:
     kv_dtype: str = "float32"
     weight_dtype: str = "float32"
     total_kv_pages: int | None = None
+    gpu_memory_utilization: float = 0.9
     # Compile-time decode loop length for the host_orch pl.unroll in l3_generate.
     # All generate() calls must use max_new_tokens <= this value; the loop always
     # runs this many decode steps (sample_and_prepare no-ops after EOS or when
