@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -536,6 +537,8 @@ class KvCacheManager:
         if not req_segments:
             return
 
+        t_restore = time.perf_counter()
+
         # segment.token_count is page-aligned (set by compress_old_tokens).
         sample_segment = next(iter(req_segments.values()))
         compressed_token_count = sample_segment.token_count
@@ -559,11 +562,12 @@ class KvCacheManager:
         )
 
         # Decompress old tokens into restore pages.
+        t_decompress = time.perf_counter()
         for layer_idx, segment in req_segments.items():
             if npu_runner is not None:
                 keys, values = pool.kv_compressor.decompress_layer_npu(
                     layer_idx, segment.compressed_k, segment.compressed_v,
-                    run_tq_decompress_fn=npu_runner.run_tq_decompress,
+                    run_kv_dequantize_fn=npu_runner.run_tq_decompress,
                 )
             else:
                 keys, values = pool.kv_compressor.decompress_layer(
@@ -572,6 +576,12 @@ class KvCacheManager:
             self._write_tokens_from_compressed(
                 pool, layer_idx, restore_alloc, 0, keys, values,
             )
+        dt_decompress = (time.perf_counter() - t_decompress) * 1000
+        print(
+            f"[TurboQuant] restore: {len(req_segments)} layers decompressed "
+            f"{dt_decompress:.1f} ms ({dt_decompress/len(req_segments):.1f} ms/layer)",
+            flush=True,
+        )
 
         # Prepend restore pages so old tokens come before resident tokens.
         # Total pages = needed_pages + resident pages.  Since ensure_one_more_slot
@@ -592,10 +602,10 @@ class KvCacheManager:
                 flush=True,
             )
 
+        dt_total = (time.perf_counter() - t_restore) * 1000
         print(
-            f"[TurboQuant] Restore complete, {alloc.tokens_used} tokens, "
-            f"{len(alloc.page_ids)} total pages, "
-            f"capacity={alloc.tokens_capacity}",
+            f"[TurboQuant] restore complete: {dt_total:.1f} ms total, "
+            f"{alloc.tokens_used} tokens, {len(alloc.page_ids)} pages",
             flush=True,
         )
         print(
@@ -645,6 +655,8 @@ class KvCacheManager:
             flush=True,
         )
 
+        t_compress = time.perf_counter()
+
         if pool.compressed_segments is None:
             pool.compressed_segments = {}
         if alloc.request_id not in pool.compressed_segments:
@@ -666,7 +678,7 @@ class KvCacheManager:
             if npu_runner is not None:
                 compressed_k, compressed_v = pool.kv_compressor.compress_layer_npu(
                     layer_idx, old_keys, old_values,
-                    run_tq_compress_fn=npu_runner.run_tq_compress,
+                    run_kv_quantize_fn=npu_runner.run_tq_compress,
                 )
             else:
                 compressed_k, compressed_v = pool.kv_compressor.compress_layer(
@@ -678,6 +690,13 @@ class KvCacheManager:
                 compressed_k=compressed_k,
                 compressed_v=compressed_v,
             )
+
+        dt_compress = (time.perf_counter() - t_compress) * 1000
+        print(
+            f"[TurboQuant] compress: {pool.num_layers} layers compressed "
+            f"{dt_compress:.1f} ms ({dt_compress/pool.num_layers:.1f} ms/layer)",
+            flush=True,
+        )
 
         # Free old token pages: remove the leading pages that held old tokens
         # and return them to the pool.  tokens_used is kept at the full logical

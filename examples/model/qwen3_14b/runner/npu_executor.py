@@ -360,36 +360,14 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         final_rms = None
         lm_head = None
 
-        # TurboQuant KV cache compression kernels (compiled only when kv_quant enabled).
+        # KV quantization kernels (compiled only when kv_quant enabled).
+        # NOTE: NPU kernels currently produce incorrect results due to a
+        # scalar-passing issue in the JIT→Simpler integration.  The Python
+        # (PyTorch) fallback path is used instead — it is fast (us-scale for
+        # typical tensor sizes) and provides the same memory reduction benefit.
         tq_compress: _L2Callable | None = None
         tq_decompress: _L2Callable | None = None
-        pool = self._kv_cache_manager._pools.get(model.config.model_id)
-        if pool is not None and pool.kv_quant_config is not None and pool.kv_quant_config.enabled:
-            import ctypes  # noqa: PLC0415
-            qwen3_tq_compress = _load_pypto_lib_qwen14b_module("turboquant_compress")
-            qwen3_tq_decompress = _load_pypto_lib_qwen14b_module("turboquant_decompress")
-
-            # Build dummy args matching the @pl.jit function signatures.
-            _n = 128  # dummy vector count for compilation
-            _d = model.config.head_dim
-            _kv_dummy = torch.zeros(_n, _d, dtype=torch.bfloat16, device="cpu")
-            _rot_dummy = torch.zeros(_d, _d, dtype=torch.bfloat16, device="cpu")
-            _norms_dummy = torch.zeros(_n, 1, dtype=torch.float16, device="cpu")
-            _indices_dummy = torch.zeros(_n, _d, dtype=torch.uint8, device="cpu")
-            _recon_dummy = torch.zeros(_n, _d, dtype=torch.bfloat16, device="cpu")
-
-            tq_compress = self._compile_l2_callable_from_jit(
-                "tq_compress",
-                qwen3_tq_compress.tq_compress_test,
-                (_kv_dummy, _rot_dummy, ctypes.c_float(-0.01), ctypes.c_float(100.0),
-                 ctypes.c_int(15), _indices_dummy, _norms_dummy),
-            )
-            tq_decompress = self._compile_l2_callable_from_jit(
-                "tq_decompress",
-                qwen3_tq_decompress.tq_decompress_test,
-                (_kv_dummy, _rot_dummy, _norms_dummy, _recon_dummy),
-            )
-        _mark("compile_turboquant")
+        _mark("compile_kv_quant")
 
         rope_cos_raw, rope_sin_raw = rope_tables(
             model.runtime.max_seq_len,
@@ -792,8 +770,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             jit_fn._cache[key] = jit_fn._compile(
                 tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl_mod,
                 platform=self._platform,
-                dump_passes=config.dump_passes,
-                diagnostic_phase=config.diagnostic_phase,
             )
         jit_output_dir = Path(jit_fn._cache[key].output_dir)
 
@@ -810,15 +786,22 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         )
         runtime_config = runtime_config or {}
 
-        # Build param_infos from the JIT compiled artifacts.
-        from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
-        compiled_view = CompiledProgram(
-            jit_fn,
-            str(work_dir),
-            backend_type=config.backend_type,
-            platform=self._platform,
-        )
-        param_infos, _, _ = compiled_view._get_metadata()
+        # Build param_infos from bind_args metadata (JIT functions
+        # don't have a .functions dict that CompiledProgram expects).
+        class _ParamInfo:
+            __slots__ = ("name", "shape", "dtype")
+            def __init__(self, name, shape, dtype=None):
+                self.name = name
+                self.shape = shape
+                self.dtype = dtype
+
+        param_infos = []
+        for pname in param_names:
+            if pname in tensor_meta:
+                meta = tensor_meta[pname]
+                param_infos.append(_ParamInfo(pname, tuple(meta.shape), meta.dtype))
+            else:
+                param_infos.append(_ParamInfo(pname, None))
         return _L2Callable(
             chip_callable=chip_callable,
             runtime_name=runtime_name,

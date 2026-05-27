@@ -163,67 +163,62 @@ class Qwen314BModelRunner(ModelRunner):
         self._l2_child_allocs: dict[tuple[str, int], tuple[int, int]] = {}
         self._l2_dirty_kv_models: set[str] = set()
 
-    def run_tq_compress(self, flat_kv, rot_matrix, lo, inv_step, n_levels_m1):
-        """Run TurboQuant compress NPU kernel: normalize + rotate + uniform quantize."""
+    def run_tq_compress(self, flat_kv, inv_scales, offset):
+        """INT-N KV quantize: per-row absmax -> UINT8.
+
+        Uses NPU kernel when available, otherwise falls back to PyTorch.
+        """
         import torch
 
         compiled = self._compiled
         if compiled.tq_compress is not None:
-            # NPU kernel path
             n = flat_kv.shape[0]
             d = flat_kv.shape[1]
             indices_out = torch.zeros(n, d, dtype=torch.uint8, device="cpu")
-            norms_out = torch.zeros(n, 1, dtype=torch.float16, device="cpu")
 
             self._run_l2_program(
                 compiled.tq_compress,
                 flat_kv.contiguous().cpu(),
-                self._l2_child_tensor(compiled.tq_compress.runtime_name, rot_matrix),
-                ctypes.c_float(lo),
-                ctypes.c_float(inv_step),
-                ctypes.c_int(n_levels_m1),
+                inv_scales.contiguous().cpu(),
+                ctypes.c_float(offset),
                 indices_out,
-                norms_out,
             )
-            return indices_out, norms_out
+            return indices_out
 
         # Fallback: pure PyTorch
         x = flat_kv.float()
-        norms = torch.norm(x, dim=-1)
-        x_normed = x / (norms.unsqueeze(-1) + 1e-8)
-        rotated = x_normed @ rot_matrix.float()
-        shifted = rotated - lo
-        scaled = shifted * inv_step
-        indices = torch.clamp(torch.floor(scaled).long(), 0, n_levels_m1).to(torch.uint8)
-        return indices, norms.to(torch.float16).unsqueeze(-1)  # [N, 1]
+        inv_s = inv_scales.float()
+        scaled = x * inv_s + offset
+        indices = torch.clamp(torch.floor(scaled).long(), 0, 255).to(torch.uint8)
+        return indices
 
-    def run_tq_decompress(self, centroid_vals, rot_matrix, norms):
-        """Run TurboQuant decompress NPU kernel: inverse rotation + scale by norms."""
+    def run_tq_decompress(self, indices, scales, offset):
+        """INT-N KV dequantize: UINT8 -> BF16.
+
+        Uses NPU kernel when available, otherwise falls back to PyTorch.
+        """
         import torch
 
         compiled = self._compiled
         if compiled.tq_decompress is not None:
-            # NPU kernel path
-            n = centroid_vals.shape[0]
-            d = centroid_vals.shape[1]
+            n = indices.shape[0]
+            d = indices.shape[1]
             reconstructed_out = torch.zeros(n, d, dtype=torch.bfloat16, device="cpu")
 
             self._run_l2_program(
                 compiled.tq_decompress,
-                centroid_vals.contiguous().cpu(),
-                self._l2_child_tensor(compiled.tq_decompress.runtime_name, rot_matrix),
-                norms.contiguous().cpu(),
+                indices.contiguous().cpu(),
+                scales.contiguous().cpu(),
+                ctypes.c_float(offset),
                 reconstructed_out,
             )
             return reconstructed_out
 
         # Fallback: pure PyTorch
-        cv = centroid_vals.float()
-        pi = rot_matrix.float()
-        n = norms.float().squeeze(-1)  # [N] from [N, 1]
-        rotated = cv @ pi
-        reconstructed = (rotated * n.unsqueeze(-1)).to(torch.bfloat16)
-        return reconstructed
+        q = indices.float()
+        s = scales.float()
+        result = (q - offset) * s
+        return result.to(torch.bfloat16)
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Run the JIT all-layer prefill kernel and return next-token logits."""
@@ -290,10 +285,11 @@ class Qwen314BModelRunner(ModelRunner):
 
         # ── KV quantization: restore compressed old tokens BEFORE building
         # block_table so that workspace pages are included in page_ids. ──
+        t_tq_restore = time.perf_counter()
         if self._kv_cache_manager.is_quantization_enabled(model_id):
-            print(f"[TurboQuant] run_decode: restoring compressed tokens before kernel", flush=True)
             for alloc in batch.kv_allocations:
                 self._kv_cache_manager.restore_compressed_tokens(model_id, alloc, npu_runner=self)
+        dt_tq_restore = (time.perf_counter() - t_tq_restore) * 1000
 
         decode_inputs = self._prepare_decode_inputs(model, batch)
         hidden = decode_inputs.hidden
@@ -525,18 +521,21 @@ class Qwen314BModelRunner(ModelRunner):
                 f"compiled program expects {len(param_infos)} arguments, got {len(args)}. Parameters: {names}"
             )
 
-        orch_args = ChipStorageTaskArgs()
+        # ChipStorageTaskArgs requires all tensors added before scalars.
+        # Collect them separately then add tensors first, scalars second.
+        tensor_entries = []
+        scalar_entries = []
         for info, arg in zip(param_infos, args, strict=True):
             if info.shape is None:
                 if not isinstance(arg, ctypes._SimpleCData):
                     raise TypeError(f"scalar parameter {info.name!r} must be passed as a ctypes scalar")
-                orch_args.add_scalar(scalar_to_uint64(arg))
+                scalar_entries.append(arg)
                 continue
             if isinstance(arg, WorkerTensor):
-                orch_args.add_tensor(arg.to_continuous_tensor())
+                tensor_entries.append(arg.to_continuous_tensor())
                 continue
             if isinstance(arg, ContinuousTensor):
-                orch_args.add_tensor(arg)
+                tensor_entries.append(arg)
                 continue
             if not isinstance(arg, torch.Tensor):
                 raise TypeError(f"tensor parameter {info.name!r} expects torch.Tensor, got {type(arg).__name__}")
@@ -546,7 +545,13 @@ class Qwen314BModelRunner(ModelRunner):
                 raise ValueError(f"tensor parameter {info.name!r} must be contiguous")
             if not arg.is_shared():
                 arg.share_memory_()
-            orch_args.add_tensor(make_tensor_arg(arg))
+            tensor_entries.append(make_tensor_arg(arg))
+
+        orch_args = ChipStorageTaskArgs()
+        for t in tensor_entries:
+            orch_args.add_tensor(t)
+        for s in scalar_entries:
+            orch_args.add_scalar(scalar_to_uint64(s))
         return orch_args
 
     # ── L3-wrapped generate: entire prefill + decode loop in one worker.run() ──

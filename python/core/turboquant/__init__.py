@@ -1,5 +1,5 @@
-"""TurboQuant KV cache compression module."""
+"""KV cache quantization module."""
 
-from .compressor import KVCompressor, KvQuantConfig, MSECompressor
+from .compressor import AbsmaxCompressor, KVCompressor, KvQuantConfig
 
-__all__ = ["KVCompressor", "KvQuantConfig", "MSECompressor"]
+__all__ = ["AbsmaxCompressor", "KVCompressor", "KvQuantConfig"]

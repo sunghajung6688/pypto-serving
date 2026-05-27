@@ -1,89 +1,40 @@
-"""MSE-optimal KV cache compressor using random rotation + Lloyd-Max quantization.
+"""INT-N KV cache compressor using per-row absmax quantization.
 
-Adapted from TurboQuant V3 (MSE-only, no QJL).
-Provides per-layer compressors with asymmetric key/value bit-widths.
+Supports configurable bit widths (2, 3, 4, 8, etc.):
+  Quantize:  q = clamp(floor(x * inv_scale + offset), 0, n_levels-1)
+  Dequantize: x_hat = (q - offset) * scale
+where inv_scale = (n_levels-1) / (2 * max_abs), offset = (n_levels-1) / 2.
+Sub-8-bit values are bit-packed for storage efficiency.
 """
 
 from __future__ import annotations
 
-import math
+import time
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
-from .lloyd_max import LloydMaxCodebook
 
+class AbsmaxCompressor:
+    """Per-row absmax INT-N compressor for one side (keys or values).
 
-def _generate_rotation_matrix(d: int, seed: int, device: str = "cpu") -> torch.Tensor:
-    """Generate a random orthogonal rotation matrix via QR decomposition."""
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
-    G = torch.randn(d, d, generator=gen)
-    Q, R = torch.linalg.qr(G)
-    diag_sign = torch.sign(torch.diag(R))
-    diag_sign[diag_sign == 0] = 1.0
-    Q = Q * diag_sign.unsqueeze(0)
-    return Q.to(device)
-
-
-class MSECompressor:
-    """Single-stage MSE-optimal compressor for one side (keys or values).
-
-    Compress normalizes to unit sphere, quantizes with Lloyd-Max,
-    and stores bit-packed indices + norms.
-
-    Supports two execution paths:
-    - compress()/decompress(): pure Python/PyTorch (fallback)
-    - compress_npu()/decompress_npu(): NPU kernel for heavy compute,
-      Python for bit-pack/unpack
+    Supports bits in {2, 3, 4, 8}. Sub-8-bit values are bit-packed.
     """
 
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu"):
+    def __init__(self, head_dim: int, bits: int = 8, device: str = "cpu"):
         self.head_dim = head_dim
-        self.bits = bits
+        self.bits = min(bits, 8)
         self.device = device
+        self.n_levels = 2 ** self.bits
+        self.half_levels = (self.n_levels - 1) / 2.0
 
-        self.Pi = _generate_rotation_matrix(head_dim, seed=seed, device=device)
-        if bits >= 8:
-            # 8-bit: uniform quantization is sufficient, skip expensive Lloyd-Max
-            n_levels = 2 ** bits
-            sigma = 1.0 / math.sqrt(head_dim)
-            lo, hi = -3.5 * sigma, 3.5 * sigma
-            self.centroids = torch.linspace(lo, hi, n_levels + 1)[1:-1].to(device)
-        else:
-            self.centroids = LloydMaxCodebook(head_dim, bits).centroids.to(device)
+    def _bit_pack(self, indices: torch.Tensor, N: int, D: int) -> tuple[torch.Tensor, int]:
+        """Pack UINT8 indices into bit-packed bytes for sub-8-bit."""
+        if self.bits >= 8:
+            # No packing needed for 8-bit
+            return indices.reshape(N, D), 0
 
-        # Uniform quantization parameters for NPU path.
-        sigma = 1.0 / math.sqrt(head_dim)
-        self._uniform_lo = -3.5 * sigma
-        self._uniform_hi = 3.5 * sigma
-        n_levels = 2 ** bits
-        self._uniform_step = (self._uniform_hi - self._uniform_lo) / (n_levels - 1)
-        self._uniform_inv_step = 1.0 / self._uniform_step
-        self._uniform_n_levels_m1 = n_levels - 1
-        # Uniform centroids for decompress NPU path (matches compress quantization).
-        self._uniform_centroids = torch.linspace(
-            self._uniform_lo, self._uniform_hi, n_levels
-        ).to(device)
-
-    @torch.no_grad()
-    def compress(self, states: torch.Tensor) -> dict:
-        """Compress (B, H, S, D) -> dict with bit-packed indices + norms."""
-        B, H, S, D = states.shape
-        N = B * H * S
-        flat = states.reshape(N, D).float()
-
-        # Normalize to unit sphere, store norms
-        vec_norms = torch.norm(flat, dim=-1)  # (N,)
-        flat_norm = flat / (vec_norms.unsqueeze(-1) + 1e-8)
-
-        # Rotate + quantize
-        rotated = flat_norm @ self.Pi.T
-        diffs = rotated.unsqueeze(-1) - self.centroids  # (N, D, levels)
-        indices = diffs.abs().argmin(dim=-1).to(torch.uint8)  # (N, D)
-
-        # Bit-pack indices
         indices_per_byte = 8 // self.bits
         idx_pad = (indices_per_byte - D % indices_per_byte) % indices_per_byte
         idx_flat = indices.long()
@@ -100,12 +51,47 @@ class MSECompressor:
             .sum(-1)
             .to(torch.uint8)
         )
+        return idx_bytes, idx_pad
+
+    def _bit_unpack(self, idx_bytes: torch.Tensor, N: int, D: int, idx_pad: int) -> torch.Tensor:
+        """Unpack bit-packed bytes back to UINT8 indices."""
+        if self.bits >= 8:
+            return idx_bytes.reshape(N, D)
+
+        indices_per_byte = 8 // self.bits
+        mask = (1 << self.bits) - 1
+        idx_shifts = torch.tensor(
+            [self.bits * i for i in range(indices_per_byte - 1, -1, -1)],
+            dtype=torch.long,
+            device=idx_bytes.device,
+        )
+        indices = (
+            (idx_bytes.long().unsqueeze(-1) >> idx_shifts) & mask
+        ).reshape(N, -1)
+        if idx_pad:
+            indices = indices[:, :D]
+        return indices.to(torch.uint8)
+
+    @torch.no_grad()
+    def compress(self, states: torch.Tensor) -> dict:
+        """Compress (B, H, S, D) -> dict with indices + per-row scales."""
+        B, H, S, D = states.shape
+        N = B * H * S
+        flat = states.reshape(N, D).float()
+
+        max_abs = flat.abs().amax(dim=-1).clamp(min=1e-8)  # [N]
+        inv_scales = ((self.n_levels - 1) / (2.0 * max_abs)).unsqueeze(-1)  # [N, 1]
+        scaled = flat * inv_scales + self.half_levels
+        indices = torch.clamp(scaled.floor().long(), 0, self.n_levels - 1).to(torch.uint8)
+
+        idx_bytes, idx_pad = self._bit_pack(indices, N, D)
 
         return {
-            "idx_bytes": idx_bytes.reshape(B, H, S, n_groups),
-            "vec_norms": vec_norms.reshape(B, H, S),
+            "idx_bytes": idx_bytes.reshape(B, H, S, -1) if self.bits < 8 else idx_bytes.reshape(B, H, S, D),
+            "scales": max_abs.half().reshape(B, H, S),
             "shape": (B, H, S, D),
             "idx_pad": idx_pad,
+            "bits": self.bits,
         }
 
     @torch.no_grad()
@@ -113,127 +99,89 @@ class MSECompressor:
         """Decompress back to (B, H, S, D) tensor."""
         B, H, S, D = compressed["shape"]
         N = B * H * S
-        idx_bytes = compressed["idx_bytes"].reshape(N, -1)
-        vec_norms = compressed["vec_norms"].reshape(N, 1).float()
-        idx_pad = compressed["idx_pad"]
+        bits = compressed.get("bits", self.bits)
 
-        # Unpack indices
-        indices_per_byte = 8 // self.bits
-        mask = (1 << self.bits) - 1
-        idx_shifts = torch.tensor(
-            [self.bits * i for i in range(indices_per_byte - 1, -1, -1)],
-            dtype=torch.long,
-            device=idx_bytes.device,
-        )
-        indices = (
-            (idx_bytes.long().unsqueeze(-1) >> idx_shifts) & mask
-        ).reshape(N, -1)
-        if idx_pad:
-            indices = indices[:, :D]
+        if bits < 8:
+            n_groups = compressed["idx_bytes"].shape[-1]
+            indices = self._bit_unpack(
+                compressed["idx_bytes"].reshape(N, n_groups), N, D, compressed["idx_pad"]
+            )
+        else:
+            indices = compressed["idx_bytes"].reshape(N, D)
 
-        # Reconstruct
-        reconstructed = (self.centroids[indices] @ self.Pi) * vec_norms
-        print(
-            f"[TQ-DEBUG] decompress: bits={self.bits}, shape=({B},{H},{S},{D}), "
-            f"dtype={reconstructed.dtype}, device={reconstructed.device}, "
-            f"has_nan={torch.isnan(reconstructed).any().item()}, "
-            f"has_inf={torch.isinf(reconstructed).any().item()}, "
-            f"min={reconstructed.min().item():.6f}, max={reconstructed.max().item():.6f}, "
-            f"mean={reconstructed.mean().item():.6f}",
-            flush=True,
-        )
-        return reconstructed.reshape(B, H, S, D)
+        q = indices.float()
+        n_levels = 2 ** bits
+        half_levels = (n_levels - 1) / 2.0
+        max_abs = compressed["scales"].reshape(N).float()
+        scale_per_level = (2.0 * max_abs / (n_levels - 1)).unsqueeze(-1)  # [N, 1]
+
+        reconstructed = (q - half_levels) * scale_per_level
+        return reconstructed.to(torch.bfloat16).reshape(B, H, S, D)
 
     @torch.no_grad()
     def compress_npu(
-        self, states: torch.Tensor, run_tq_compress_fn
+        self, states: torch.Tensor, run_kv_quantize_fn
     ) -> dict:
-        """Compress using NPU kernel for norm+rotate+quantize, Python for bit-pack.
+        """Compress using NPU kernel for quantization, Python for scale + bit-pack.
 
         Args:
             states: (B, H, S, D) BF16 tensor.
-            run_tq_compress_fn: callable(flat_kv, rot_matrix, lo, inv_step, n_levels_m1)
-                                -> (indices_uint8, norms_fp16)
+            run_kv_quantize_fn: callable(flat_kv, inv_scales, offset) -> indices_uint8
         """
         B, H, S, D = states.shape
         N = B * H * S
         flat = states.reshape(N, D)
 
-        # NPU kernel: normalize + rotate + uniform quantize
-        # Note: compress uses Pi.T for rotation (kernel does x @ rot_matrix,
-        # so we pass Pi.T). Decompress uses Pi (inverse rotation).
-        indices, vec_norms = run_tq_compress_fn(
-            flat_kv=flat,
-            rot_matrix=self.Pi.T,
-            lo=self._uniform_lo,
-            inv_step=self._uniform_inv_step,
-            n_levels_m1=self._uniform_n_levels_m1,
+        max_abs = flat.float().abs().amax(dim=-1).clamp(min=1e-8)  # [N]
+        inv_scales = ((self.n_levels - 1) / (2.0 * max_abs)).unsqueeze(-1).contiguous()  # [N, 1]
+
+        indices = run_kv_quantize_fn(
+            flat_kv=flat.contiguous(),
+            inv_scales=inv_scales,
+            offset=self.half_levels,
         )
 
-        # Python: bit-pack indices
-        indices_per_byte = 8 // self.bits
-        idx_pad = (indices_per_byte - D % indices_per_byte) % indices_per_byte
-        idx_flat = indices.long()
-        if idx_pad:
-            idx_flat = F.pad(idx_flat, (0, idx_pad))
-        n_groups = idx_flat.shape[-1] // indices_per_byte
-        idx_powers = torch.tensor(
-            [2 ** (self.bits * i) for i in range(indices_per_byte - 1, -1, -1)],
-            dtype=torch.long,
-            device=idx_flat.device,
-        )
-        idx_bytes = (
-            (idx_flat.reshape(N, n_groups, indices_per_byte) * idx_powers)
-            .sum(-1)
-            .to(torch.uint8)
-        )
+        idx_bytes, idx_pad = self._bit_pack(indices, N, D)
 
         return {
-            "idx_bytes": idx_bytes.reshape(B, H, S, n_groups),
-            "vec_norms": vec_norms.squeeze(-1).reshape(B, H, S),
+            "idx_bytes": idx_bytes.reshape(B, H, S, -1) if self.bits < 8 else idx_bytes.reshape(B, H, S, D),
+            "scales": max_abs.half().reshape(B, H, S),
             "shape": (B, H, S, D),
             "idx_pad": idx_pad,
+            "bits": self.bits,
         }
 
     @torch.no_grad()
     def decompress_npu(
-        self, compressed: dict, run_tq_decompress_fn
+        self, compressed: dict, run_kv_dequantize_fn
     ) -> torch.Tensor:
-        """Decompress: Python bit-unpack + lookup, NPU inverse rotation + scale.
+        """Decompress using NPU kernel for dequantization.
 
         Args:
             compressed: dict from compress_npu().
-            run_tq_decompress_fn: callable(centroid_vals, rot_matrix, norms)
-                                  -> reconstructed_bf16
+            run_kv_dequantize_fn: callable(indices, scales, offset) -> reconstructed_bf16
         """
         B, H, S, D = compressed["shape"]
         N = B * H * S
-        idx_bytes = compressed["idx_bytes"].reshape(N, -1)
-        vec_norms = compressed["vec_norms"].reshape(N)
-        idx_pad = compressed["idx_pad"]
+        bits = compressed.get("bits", self.bits)
+        n_levels = 2 ** bits
+        half_levels = (n_levels - 1) / 2.0
 
-        # Python: bit-unpack
-        indices_per_byte = 8 // self.bits
-        mask = (1 << self.bits) - 1
-        idx_shifts = torch.tensor(
-            [self.bits * i for i in range(indices_per_byte - 1, -1, -1)],
-            dtype=torch.long,
-            device=idx_bytes.device,
-        )
-        indices = (
-            (idx_bytes.long().unsqueeze(-1) >> idx_shifts) & mask
-        ).reshape(N, -1)
-        if idx_pad:
-            indices = indices[:, :D]
+        if bits < 8:
+            n_groups = compressed["idx_bytes"].shape[-1]
+            indices = self._bit_unpack(
+                compressed["idx_bytes"].reshape(N, n_groups), N, D, compressed["idx_pad"]
+            )
+        else:
+            indices = compressed["idx_bytes"].reshape(N, D)
 
-        # Python: centroid lookup (small table, fast on CPU)
-        centroid_vals = self._uniform_centroids[indices].to(torch.bfloat16)
+        max_abs = compressed["scales"].reshape(N).float()
+        scale_per_level = (2.0 * max_abs / (n_levels - 1)).unsqueeze(-1).contiguous()  # [N, 1]
 
-        # NPU kernel: inverse rotation + scale by norms
-        reconstructed = run_tq_decompress_fn(
-            centroid_vals=centroid_vals,
-            rot_matrix=self.Pi,
-            norms=vec_norms.unsqueeze(-1),  # [N] -> [N, 1] for kernel
+        reconstructed = run_kv_dequantize_fn(
+            indices=indices.contiguous(),
+            scales=scale_per_level,
+            offset=half_levels,
         )
         return reconstructed.reshape(B, H, S, D)
 
@@ -244,17 +192,17 @@ class KvQuantConfig:
 
     enabled: bool = False
     key_bits: int = 4
-    value_bits: int = 2
+    value_bits: int = 4
     residual_window: int = 128
     protected_layers: int = 4
     protected_bits: int = 8
 
 
 class KVCompressor:
-    """Per-layer KV cache compressor with asymmetric key/value bit-widths.
+    """Per-layer KV cache compressor with configurable INT-N quantization.
 
-    Each layer gets its own compressor instance with a unique seed,
-    enabling layer-adaptive precision (protected layers get more bits).
+    Each layer gets its own AbsmaxCompressor with configurable bit width,
+    enabling layer-adaptive precision.
     """
 
     def __init__(
@@ -268,10 +216,12 @@ class KVCompressor:
         self.head_dim = head_dim
         self.config = config
 
-        self.key_compressors: list[MSECompressor] = []
-        self.val_compressors: list[MSECompressor] = []
+        self.key_compressors: list[AbsmaxCompressor] = []
+        self.val_compressors: list[AbsmaxCompressor] = []
 
-        print(f"[TurboQuant] Initializing KVCompressor: {num_layers} layers, head_dim={head_dim}", flush=True)
+        print(f"[KV-Quant] Initializing: {num_layers} layers, head_dim={head_dim}, "
+              f"key_bits={config.key_bits}, val_bits={config.value_bits}", flush=True)
+        t_total = time.perf_counter()
         for layer_idx in range(num_layers):
             is_protected = (
                 layer_idx < config.protected_layers
@@ -282,15 +232,15 @@ class KVCompressor:
             effective_key_bits = min(effective_key_bits, 8)
             effective_val_bits = min(effective_val_bits, 8)
 
-            seed_base = seed + layer_idx * 1000
-            print(f"[TurboQuant]   layer {layer_idx}: key_bits={effective_key_bits}, val_bits={effective_val_bits}", flush=True)
             self.key_compressors.append(
-                MSECompressor(head_dim, effective_key_bits, seed=seed_base, device=device)
+                AbsmaxCompressor(head_dim, effective_key_bits, device=device)
             )
             self.val_compressors.append(
-                MSECompressor(head_dim, effective_val_bits, seed=seed_base + 500, device=device)
+                AbsmaxCompressor(head_dim, effective_val_bits, device=device)
             )
-        print(f"[TurboQuant] KVCompressor initialization complete", flush=True)
+            print(f"[KV-Quant]   layer {layer_idx}: key_bits={effective_key_bits}, val_bits={effective_val_bits}", flush=True)
+        dt_total = (time.perf_counter() - t_total) * 1000
+        print(f"[KV-Quant] Initialization complete: {dt_total:.1f} ms", flush=True)
 
     @torch.no_grad()
     def compress_layer(
@@ -302,18 +252,19 @@ class KVCompressor:
         """Compress keys/values for one layer (Python fallback).
 
         Args:
-            keys: (S, H, D) — old tokens to compress
-            values: (S, H, D) — old tokens to compress
+            keys: (S, H, D) -- old tokens to compress
+            values: (S, H, D) -- old tokens to compress
 
         Returns:
             (compressed_k, compressed_v) dicts
         """
-        # Reshape (S, H, D) -> (1, H, S, D) for MSECompressor
+        t0 = time.perf_counter()
         keys_4d = keys.permute(1, 0, 2).unsqueeze(0)
         values_4d = values.permute(1, 0, 2).unsqueeze(0)
 
         compressed_k = self.key_compressors[layer_idx].compress(keys_4d)
         compressed_v = self.val_compressors[layer_idx].compress(values_4d)
+        print(f"[KV-Quant] compress_layer {layer_idx} (python): {(time.perf_counter()-t0)*1000:.1f} ms", flush=True)
         return compressed_k, compressed_v
 
     @torch.no_grad()
@@ -322,23 +273,25 @@ class KVCompressor:
         layer_idx: int,
         keys: torch.Tensor,
         values: torch.Tensor,
-        run_tq_compress_fn,
+        run_kv_quantize_fn,
     ) -> tuple[dict, dict]:
         """Compress keys/values for one layer using NPU kernels.
 
         Args:
-            keys: (S, H, D) — old tokens to compress
-            values: (S, H, D) — old tokens to compress
-            run_tq_compress_fn: NPU compress callable
+            keys: (S, H, D) -- old tokens to compress
+            values: (S, H, D) -- old tokens to compress
+            run_kv_quantize_fn: NPU quantize callable
 
         Returns:
             (compressed_k, compressed_v) dicts
         """
+        t0 = time.perf_counter()
         keys_4d = keys.permute(1, 0, 2).unsqueeze(0)
         values_4d = values.permute(1, 0, 2).unsqueeze(0)
 
-        compressed_k = self.key_compressors[layer_idx].compress_npu(keys_4d, run_tq_compress_fn)
-        compressed_v = self.val_compressors[layer_idx].compress_npu(values_4d, run_tq_compress_fn)
+        compressed_k = self.key_compressors[layer_idx].compress_npu(keys_4d, run_kv_quantize_fn)
+        compressed_v = self.val_compressors[layer_idx].compress_npu(values_4d, run_kv_quantize_fn)
+        print(f"[KV-Quant] compress_layer {layer_idx} (npu): {(time.perf_counter()-t0)*1000:.1f} ms", flush=True)
         return compressed_k, compressed_v
 
     @torch.no_grad()
@@ -353,12 +306,13 @@ class KVCompressor:
         Returns:
             keys: (S, H, D), values: (S, H, D)
         """
+        t0 = time.perf_counter()
         keys_4d = self.key_compressors[layer_idx].decompress(compressed_k)
         values_4d = self.val_compressors[layer_idx].decompress(compressed_v)
 
-        # (1, H, S, D) -> (S, H, D)
         keys = keys_4d.squeeze(0).permute(1, 0, 2)
         values = values_4d.squeeze(0).permute(1, 0, 2)
+        print(f"[KV-Quant] decompress_layer {layer_idx} (python): {(time.perf_counter()-t0)*1000:.1f} ms", flush=True)
         return keys, values
 
     @torch.no_grad()
@@ -367,16 +321,18 @@ class KVCompressor:
         layer_idx: int,
         compressed_k: dict,
         compressed_v: dict,
-        run_tq_decompress_fn,
+        run_kv_dequantize_fn,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Decompress keys/values for one layer using NPU kernels.
 
         Returns:
             keys: (S, H, D), values: (S, H, D)
         """
-        keys_4d = self.key_compressors[layer_idx].decompress_npu(compressed_k, run_tq_decompress_fn)
-        values_4d = self.val_compressors[layer_idx].decompress_npu(compressed_v, run_tq_decompress_fn)
+        t0 = time.perf_counter()
+        keys_4d = self.key_compressors[layer_idx].decompress_npu(compressed_k, run_kv_dequantize_fn)
+        values_4d = self.val_compressors[layer_idx].decompress_npu(compressed_v, run_kv_dequantize_fn)
 
         keys = keys_4d.squeeze(0).permute(1, 0, 2)
         values = values_4d.squeeze(0).permute(1, 0, 2)
+        print(f"[KV-Quant] decompress_layer {layer_idx} (npu): {(time.perf_counter()-t0)*1000:.1f} ms", flush=True)
         return keys, values
