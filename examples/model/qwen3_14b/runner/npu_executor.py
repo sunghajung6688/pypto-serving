@@ -367,6 +367,66 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         # typical tensor sizes) and provides the same memory reduction benefit.
         tq_compress: _L2Callable | None = None
         tq_decompress: _L2Callable | None = None
+
+        # TQ fused-dequant kernels for prefill and decode.
+        kv_quant_config = getattr(model.runtime, "kv_quant_config", None)
+        prefill_tq: _L2Callable | None = None
+        decode_tq: _L2Callable | None = None
+        if kv_quant_config is not None and kv_quant_config.enabled:
+            # Prefill TQ kernel: inline KV quantization on NPU.
+            # Uses real TurboQuant (rotation + fixed-range quantization).
+            # Batched norms write is aligned ([TOK_TILE, 1] = 128 bytes).
+            qwen3_prefill_tq = _load_pypto_lib_qwen14b_module("prefill_tq")
+            prefill_tq_program = qwen3_prefill_tq.build_qwen3_14b_prefill_tq_program(
+                max_seq=model.runtime.max_seq_len,
+                hidden_size=model.config.hidden_size,
+                num_heads=model.config.num_attention_heads,
+                num_kv_heads=model.config.num_key_value_heads,
+                head_dim=model.config.head_dim,
+                intermediate_size=model.config.intermediate_size,
+            )
+            prefill_tq = self._compile_l2_callable("prefill_tq", prefill_tq_program)
+            qwen3_decode_full_tq = _load_pypto_lib_qwen14b_module("decode_full_tq")
+            decode_tq_program = qwen3_decode_full_tq.build_qwen3_decode_tq_program(
+                batch=kernel_batch,
+                max_seq=model.runtime.max_seq_len,
+                hidden_size=model.config.hidden_size,
+                intermediate_size=model.config.intermediate_size,
+                num_heads=model.config.num_attention_heads,
+                num_kv_heads=model.config.num_key_value_heads,
+                head_dim=model.config.head_dim,
+                num_layers=model.config.num_hidden_layers,
+            )
+            decode_tq = self._compile_l2_callable("decode_tq", decode_tq_program)
+            _mark("compile_decode_tq")
+
+            # TQ compress/decompress kernels for CPU-side KV compression.
+            tq_compress_mod = _load_pypto_lib_qwen14b_module("turboquant_compress")
+            tq_compress_program = tq_compress_mod.build_tq_compress_program(
+                head_dim=model.config.head_dim,
+            )
+            tq_compress = self._compile_l2_callable("tq_compress", tq_compress_program)
+            _mark("compile_tq_compress")
+
+            tq_decompress_mod = _load_pypto_lib_qwen14b_module("turboquant_decompress")
+            tq_decompress_program = tq_decompress_mod.build_tq_decompress_program(
+                head_dim=model.config.head_dim,
+            )
+            tq_decompress = self._compile_l2_callable("tq_decompress", tq_decompress_program)
+            _mark("compile_tq_decompress")
+
+            # Generate per-layer rotation matrices matching the compressor seeds.
+            from python.core.turboquant.compressor import generate_rotation_matrix  # noqa: PLC0415
+            rot_mats = torch.stack([
+                generate_rotation_matrix(model.config.head_dim, seed=42 + l * 1000)
+                for l in range(model.config.num_hidden_layers)
+            ]).bfloat16().contiguous().cpu()
+            # Reshape to [num_layers * head_dim, head_dim] for kernel slicing.
+            num_layers = model.config.num_hidden_layers
+            head_dim = model.config.head_dim
+            rot_matrices = rot_mats.reshape(num_layers * head_dim, head_dim)
+        else:
+            rot_matrices = None
         _mark("compile_kv_quant")
 
         rope_cos_raw, rope_sin_raw = rope_tables(
@@ -556,6 +616,9 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             l3_generate_param_infos=l3_generate_param_infos,
             tq_compress=tq_compress,
             tq_decompress=tq_decompress,
+            prefill_tq=prefill_tq,
+            decode_tq=decode_tq,
+            rot_matrices=self._shared_tensor(rot_matrices) if rot_matrices is not None else None,
         )
 
     def _compile_l2_callable(self, name: str, program: object) -> _L2Callable:

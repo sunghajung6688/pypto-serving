@@ -30,14 +30,9 @@ def _get_kv_compressor_cls():
 
 
 @dataclass
-class _CompressedSegment:
-    """Compressed KV data for a contiguous range of old tokens in one layer."""
-
-    token_start: int
-    token_count: int
-    compressed_k: dict
-    compressed_v: dict
-    freed_page_ids: list[int] = field(default_factory=list)
+class _RequestQuantState:
+    """Per-request tracking for KV quantization."""
+    quant_page_count: int = 0  # how many compressed pages stored in quant_* buffers
 
 
 NONE_HASH = hash(("__none__",))
@@ -205,7 +200,7 @@ class KvCacheManager:
             # pool for reuse by *other* requests on the same model).
             num_pages = runtime.max_batch_size * max_blocks_per_seq
             print(
-                f"[TurboQuant] Using full bf16 pages ({num_pages}) to match "
+                f"[KV-Quant] Using full bf16 pages ({num_pages}) to match "
                 f"compiled kernel stride. Compression frees pages for reuse.",
                 flush=True,
             )
@@ -225,9 +220,12 @@ class KvCacheManager:
         value_pages = torch.zeros_like(key_pages)
         # Initialize KV quantization if configured
         kv_compressor = None
-        compressed_segments = None
+        quant_key_indices = None
+        quant_key_norms = None
+        quant_val_indices = None
+        quant_val_norms = None
         if kv_quant_config is not None and kv_quant_config.enabled:
-            print(f"[TurboQuant] Creating KVCompressor for model {model_id} ...", flush=True)
+            print(f"[KV-Quant] Creating KVCompressor for model {model_id} ...", flush=True)
             KVCompressor = _get_kv_compressor_cls()
             kv_compressor = KVCompressor(
                 head_dim=config.head_dim,
@@ -235,8 +233,31 @@ class KvCacheManager:
                 config=kv_quant_config,
                 device=runtime.device,
             )
-            print(f"[TurboQuant] KVCompressor for model {model_id} created", flush=True)
-            compressed_segments = {}
+            print(f"[KV-Quant] KVCompressor for model {model_id} created", flush=True)
+
+            # Compressed storage: non-packed uint8, one byte per element.
+            # For int4 (n_levels=16), each element stores values 0-15 in uint8.
+            # Shape: [num_layers, max_seq_pages, num_kv_heads, page_size, head_dim]
+            quant_key_indices = torch.zeros(
+                config.num_hidden_layers, max_blocks_per_seq,
+                config.num_key_value_heads, runtime.page_size, config.head_dim,
+                dtype=torch.uint8, device=runtime.device,
+            )
+            quant_key_norms = torch.zeros(
+                config.num_hidden_layers, max_blocks_per_seq,
+                config.num_key_value_heads, runtime.page_size, 1,
+                dtype=torch.float16, device=runtime.device,
+            )
+            quant_val_indices = torch.zeros(
+                config.num_hidden_layers, max_blocks_per_seq,
+                config.num_key_value_heads, runtime.page_size, config.head_dim,
+                dtype=torch.uint8, device=runtime.device,
+            )
+            quant_val_norms = torch.zeros(
+                config.num_hidden_layers, max_blocks_per_seq,
+                config.num_key_value_heads, runtime.page_size, 1,
+                dtype=torch.float16, device=runtime.device,
+            )
 
         self._pools[model_id] = _CachePool(
             page_size=runtime.page_size,
@@ -496,15 +517,48 @@ class KvCacheManager:
             pool.value_pages.reshape(-1, pool.head_dim),
         )
 
+    def materialize_single_layer_quant_cache(self, model_id: str, layer_idx: int):
+        """Return flattened quant K/V cache views for one layer.
+
+        Returns (quant_k, quant_v, quant_k_norms, quant_v_norms) each as 2D
+        tensors suitable for kernel arguments. Returns (None, None, None, None)
+        if quantization is not enabled.
+        """
+        pool = self._pool(model_id)
+        if pool.quant_key_indices is None:
+            return None, None, None, None
+        rows_per_layer = pool.max_blocks_per_seq * pool.num_kv_heads * pool.page_size
+        return (
+            pool.quant_key_indices[layer_idx].reshape(-1, pool.head_dim),
+            pool.quant_val_indices[layer_idx].reshape(-1, pool.head_dim),
+            pool.quant_key_norms[layer_idx].reshape(-1, 1),
+            pool.quant_val_norms[layer_idx].reshape(-1, 1),
+        )
+
+    def materialize_full_layer_quant_cache(self, model_id: str):
+        """Return flattened quant K/V cache views across all layers.
+
+        Returns (quant_k, quant_v, quant_k_norms, quant_v_norms) each as 2D
+        tensors. Returns (None, None, None, None) if quantization is not enabled.
+        """
+        pool = self._pool(model_id)
+        if pool.quant_key_indices is None:
+            return None, None, None, None
+        return (
+            pool.quant_key_indices.reshape(-1, pool.head_dim),
+            pool.quant_val_indices.reshape(-1, pool.head_dim),
+            pool.quant_key_norms.reshape(-1, 1),
+            pool.quant_val_norms.reshape(-1, 1),
+        )
+
     def free(self, alloc: KvAllocation) -> None:
         """Return an allocation's pages to the model pool."""
         self.release_request(alloc.request_id)
         alloc.page_ids.clear()
         alloc.tokens_capacity = 0
         alloc.tokens_used = 0
-        # Also clean up compressed segments for this request
-        if pool.compressed_segments is not None:
-            pool.compressed_segments.pop(alloc.request_id, None)
+        # Clean up per-request quantization state.
+        pool.request_quant_states.pop(alloc.request_id, None)
 
     # ── KV cache quantization ──
 
@@ -513,237 +567,105 @@ class KvCacheManager:
         pool = self._pool(model_id)
         return pool.kv_compressor is not None
 
-    def clear_compressed_segments(self, model_id: str, request_id: str) -> None:
-        """Clear compressed segments for a request without freeing its pages."""
+    def get_quant_state(self, model_id: str, request_id: str) -> _RequestQuantState:
+        """Get or create per-request quantization state."""
         pool = self._pool(model_id)
-        if pool.compressed_segments is not None:
-            pool.compressed_segments.pop(request_id, None)
+        if request_id not in pool.request_quant_states:
+            pool.request_quant_states[request_id] = _RequestQuantState()
+        return pool.request_quant_states[request_id]
 
-    def restore_compressed_tokens(self, model_id: str, alloc: KvAllocation, npu_runner=None) -> None:
-        """Decompress old tokens back into pages and prepend before kernel execution.
+    def _layer_key_bits(self, pool: _CachePool, layer_idx: int) -> int:
+        """Return the effective key bits for a layer (respects protected layers)."""
+        cfg = pool.kv_quant_config
+        protected = cfg.protected_layers
+        if layer_idx < protected or layer_idx >= pool.num_layers - protected:
+            return cfg.protected_bits
+        return cfg.key_bits
 
-        Takes pages from the free pool (same count as were freed during compression)
-        so the total page count equals the pre-compression count, never exceeding
-        max_blocks_per_seq.
+    def _layer_val_bits(self, pool: _CachePool, layer_idx: int) -> int:
+        """Return the effective value bits for a layer (respects protected layers)."""
+        cfg = pool.kv_quant_config
+        protected = cfg.protected_layers
+        if layer_idx < protected or layer_idx >= pool.num_layers - protected:
+            return cfg.protected_bits
+        return cfg.value_bits
 
-        Args:
-            npu_runner: If provided, use NPU kernels for decompress. Otherwise
-                        fall back to pure Python/PyTorch.
-        """
-        pool = self._pool(model_id)
-        if pool.compressed_segments is None or pool.kv_compressor is None:
-            return
-        req_segments = pool.compressed_segments.get(alloc.request_id)
-        if not req_segments:
-            return
+    def compress_to_quant(self, model_id: str, alloc: KvAllocation, npu_runner=None) -> list[int]:
+        """Quantize ALL tokens into quant_* buffers and free their BF16 pages.
 
-        t_restore = time.perf_counter()
-
-        # segment.token_count is page-aligned (set by compress_old_tokens).
-        sample_segment = next(iter(req_segments.values()))
-        compressed_token_count = sample_segment.token_count
-        needed_pages = compressed_token_count // pool.page_size
-
-        # Take pages from the free pool (same count as were freed by compress).
-        restore_pages = self._take_pages(pool, needed_pages)
-        print(
-            f"[TurboQuant] Restoring compressed tokens for request {alloc.request_id}: "
-            f"{compressed_token_count} old tokens into {needed_pages} pages {restore_pages}",
-            flush=True,
-        )
-
-        # Build a temporary allocation over restore pages for writing.
-        restore_alloc = KvAllocation(
-            request_id=alloc.request_id,
-            model_id=alloc.model_id,
-            page_ids=restore_pages,
-            tokens_capacity=needed_pages * pool.page_size,
-            tokens_used=0,
-        )
-
-        # Decompress old tokens into restore pages.
-        t_decompress = time.perf_counter()
-        for layer_idx, segment in req_segments.items():
-            if npu_runner is not None:
-                keys, values = pool.kv_compressor.decompress_layer_npu(
-                    layer_idx, segment.compressed_k, segment.compressed_v,
-                    run_kv_dequantize_fn=npu_runner.run_tq_decompress,
-                )
-            else:
-                keys, values = pool.kv_compressor.decompress_layer(
-                    layer_idx, segment.compressed_k, segment.compressed_v,
-                )
-            self._write_tokens_from_compressed(
-                pool, layer_idx, restore_alloc, 0, keys, values,
-            )
-        dt_decompress = (time.perf_counter() - t_decompress) * 1000
-        print(
-            f"[TurboQuant] restore: {len(req_segments)} layers decompressed "
-            f"{dt_decompress:.1f} ms ({dt_decompress/len(req_segments):.1f} ms/layer)",
-            flush=True,
-        )
-
-        # Prepend restore pages so old tokens come before resident tokens.
-        # Total pages = needed_pages + resident pages.  Since ensure_one_more_slot
-        # already allocated a page for the decode token (between run_decode calls),
-        # the alloc may have grown by one.  Trim back to max_blocks_per_seq if needed
-        # — the decode page from ensure_one_more_slot is now subsumed by the restore.
-        alloc.page_ids = restore_pages + alloc.page_ids
-        alloc.tokens_capacity = len(alloc.page_ids) * pool.page_size
-
-        if len(alloc.page_ids) > pool.max_blocks_per_seq:
-            excess = len(alloc.page_ids) - pool.max_blocks_per_seq
-            trimmed = alloc.page_ids[pool.max_blocks_per_seq:]
-            alloc.page_ids = alloc.page_ids[:pool.max_blocks_per_seq]
-            alloc.tokens_capacity = len(alloc.page_ids) * pool.page_size
-            pool.free_pages.extend(trimmed)
-            print(
-                f"[TurboQuant] Trimmed {excess} excess pages to fit max_blocks={pool.max_blocks_per_seq}",
-                flush=True,
-            )
-
-        dt_total = (time.perf_counter() - t_restore) * 1000
-        print(
-            f"[TurboQuant] restore complete: {dt_total:.1f} ms total, "
-            f"{alloc.tokens_used} tokens, {len(alloc.page_ids)} pages",
-            flush=True,
-        )
-        print(
-            f"[TQ-DEBUG] restore: page_ids={alloc.page_ids}, "
-            f"tokens_used={alloc.tokens_used}, tokens_capacity={alloc.tokens_capacity}, "
-            f"max_blocks_per_seq={pool.max_blocks_per_seq}, "
-            f"pool.num_pages={pool.key_pages.shape[1]}, "
-            f"pool.free_pages remaining={len(pool.free_pages)}",
-            flush=True,
-        )
-
-    def compress_old_tokens(self, model_id: str, alloc: KvAllocation, npu_runner=None) -> None:
-        """Compress old tokens (beyond residual_window) and free their bf16 pages.
-
-        Only fully-old pages are freed.  A boundary page that contains both old
-        and residual tokens is kept as a resident page — this avoids having to
-        split a page or lose residual data.
-
-        Args:
-            npu_runner: If provided, use NPU kernels for compress. Otherwise
-                        fall back to pure Python/PyTorch.
+        Called after standard BF16 prefill to move KV data to compressed format.
+        Also used for decode-time migration (residual_window, not yet implemented).
         """
         pool = self._pool(model_id)
         if pool.kv_compressor is None or pool.kv_quant_config is None:
-            return
+            return []
+        if pool.quant_key_indices is None:
+            return []
 
-        residual_window = pool.kv_quant_config.residual_window
         tokens_used = alloc.tokens_used
-        if tokens_used <= residual_window:
-            return
+        page_count = (tokens_used + pool.page_size - 1) // pool.page_size  # ceil: compress all pages
+        if page_count == 0:
+            return []
 
-        old_token_count = tokens_used - residual_window
-        # Use FLOOR division: only free pages that are FULLY occupied by old
-        # tokens.  The boundary page (if any) may contain both old and residual
-        # tokens and is kept as a resident page.
-        old_page_count = old_token_count // pool.page_size
-        if old_page_count == 0:
-            # Not enough old tokens to fill even one page — nothing to free.
-            return
-        # Page-aligned count: the actual number of tokens we compress.
-        compressed_token_count = old_page_count * pool.page_size
+        state = self.get_quant_state(model_id, alloc.request_id)
+        quant_start_page = state.quant_page_count
+
         print(
-            f"[TurboQuant] Compressing old tokens: total={tokens_used}, "
-            f"window={residual_window}, compressing={compressed_token_count} old tokens "
-            f"({old_page_count} pages, {old_token_count - compressed_token_count} "
-            f"boundary tokens kept in resident page)",
+            f"[KV-Quant] compress_to_quant: total={tokens_used}, "
+            f"compressing {page_count} pages at quant offset={quant_start_page}",
             flush=True,
         )
 
         t_compress = time.perf_counter()
 
-        if pool.compressed_segments is None:
-            pool.compressed_segments = {}
-        if alloc.request_id not in pool.compressed_segments:
-            pool.compressed_segments[alloc.request_id] = {}
-
         for layer_idx in range(pool.num_layers):
-            old_keys, old_values = self.read_context(
-                layer_idx, alloc, upto_tokens=compressed_token_count,
-            )
-            if layer_idx == 0:
-                print(
-                    f"[TQ-DEBUG] compress_old_tokens layer 0: "
-                    f"old_keys shape={old_keys.shape}, dtype={old_keys.dtype}, "
-                    f"nan={torch.isnan(old_keys).any().item()}, inf={torch.isinf(old_keys).any().item()}, "
-                    f"min={old_keys.min().item():.6f}, max={old_keys.max().item():.6f}, "
-                    f"mean={old_keys.mean().item():.6f}",
-                    flush=True,
-                )
+            old_keys, old_values = self.read_context(layer_idx, alloc)
+
             if npu_runner is not None:
                 compressed_k, compressed_v = pool.kv_compressor.compress_layer_npu(
                     layer_idx, old_keys, old_values,
-                    run_kv_quantize_fn=npu_runner.run_tq_compress,
+                    run_tq_compress_fn=npu_runner.run_tq_compress,
                 )
             else:
                 compressed_k, compressed_v = pool.kv_compressor.compress_layer(
                     layer_idx, old_keys, old_values,
                 )
-            pool.compressed_segments[alloc.request_id][layer_idx] = _CompressedSegment(
-                token_start=0,
-                token_count=compressed_token_count,
-                compressed_k=compressed_k,
-                compressed_v=compressed_v,
-            )
+
+            idx_k = compressed_k.get("idx_bytes")
+            norms_k = compressed_k.get("norms")
+            idx_v = compressed_v.get("idx_bytes")
+            norms_v = compressed_v.get("norms")
+            if isinstance(idx_k, torch.Tensor) and isinstance(norms_k, torch.Tensor):
+                packed_k = idx_k.shape[-1]
+                packed_v = idx_v.shape[-1]
+                for p in range(page_count):
+                    tok_start = p * pool.page_size
+                    tok_end = tok_start + pool.page_size
+                    qp = quant_start_page + p
+                    pool.quant_key_indices[layer_idx, qp, :, :, :packed_k] = idx_k[0, :, tok_start:tok_end, :]
+                    pool.quant_key_norms[layer_idx, qp, :, :, 0] = norms_k[0, :, tok_start:tok_end, 0]
+                    pool.quant_val_indices[layer_idx, qp, :, :, :packed_v] = idx_v[0, :, tok_start:tok_end, :]
+                    pool.quant_val_norms[layer_idx, qp, :, :, 0] = norms_v[0, :, tok_start:tok_end, 0]
+
+        state.quant_page_count = quant_start_page + page_count
 
         dt_compress = (time.perf_counter() - t_compress) * 1000
         print(
-            f"[TurboQuant] compress: {pool.num_layers} layers compressed "
+            f"[KV-Quant] compress_to_quant: {pool.num_layers} layers, "
             f"{dt_compress:.1f} ms ({dt_compress/pool.num_layers:.1f} ms/layer)",
             flush=True,
         )
 
-        # Free old token pages: remove the leading pages that held old tokens
-        # and return them to the pool.  tokens_used is kept at the full logical
-        # sequence length so the kernel knows the total context length.
-        freed_pages = alloc.page_ids[:old_page_count]
-        alloc.page_ids = alloc.page_ids[old_page_count:]
+        freed_pages = alloc.page_ids[:page_count]
+        alloc.page_ids = alloc.page_ids[page_count:]
         alloc.tokens_capacity = len(alloc.page_ids) * pool.page_size
         pool.free_pages.extend(freed_pages)
-        # Store freed page IDs in every layer's segment so restore can reuse
-        # the exact same physical pages (avoids exceeding max_blocks_per_seq).
-        for seg in pool.compressed_segments[alloc.request_id].values():
-            seg.freed_page_ids = freed_pages
         print(
-            f"[TurboQuant] Freed {len(freed_pages)} bf16 pages, "
-            f"{len(alloc.page_ids)} resident pages remain, "
-            f"pool free_pages={len(pool.free_pages)}",
+            f"[KV-Quant] Freed {len(freed_pages)} bf16 pages, "
+            f"{len(alloc.page_ids)} resident pages remain",
             flush=True,
         )
-
-    def _write_tokens_from_compressed(
-        self,
-        pool: _CachePool,
-        layer_idx: int,
-        alloc: KvAllocation,
-        start_token_index: int,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-    ) -> None:
-        """Write decompressed tokens back into paged cache."""
-        cache_dtype = pool.key_pages.dtype
-        print(
-            f"[TQ-DEBUG] _write_tokens_from_compressed: layer={layer_idx}, "
-            f"keys shape={keys.shape}, keys dtype={keys.dtype}, "
-            f"cache_dtype={cache_dtype}, pool.num_pages={pool.key_pages.shape[1]}, "
-            f"alloc.page_ids len={len(alloc.page_ids)}, "
-            f"alloc.page_ids max={max(alloc.page_ids) if alloc.page_ids else 'N/A'}, "
-            f"keys nan={torch.isnan(keys).any().item()}, inf={torch.isinf(keys).any().item()}, "
-            f"keys min={keys.min().item():.6f}, max={keys.max().item():.6f}",
-            flush=True,
-        )
-        for row in range(keys.shape[0]):
-            token_index = start_token_index + row
-            page_idx = token_index // pool.page_size
-            offset = token_index % pool.page_size
-            physical_page = alloc.page_ids[page_idx]
-            pool.key_pages[layer_idx, physical_page, :, offset, :] = keys[row].to(cache_dtype)
-            pool.value_pages[layer_idx, physical_page, :, offset, :] = values[row].to(cache_dtype)
+        return freed_pages
 
     def print_kv_cache_memory(self, model_id: str) -> None:
         """Calculate and print KV cache memory usage for a model."""
@@ -778,19 +700,16 @@ class KvCacheManager:
         print(f"[KV Cache] max_seq_len per request = {max_seq_len} tokens "
               f"(max_blocks_per_seq={pool.max_blocks_per_seq}, page_size={pool.page_size})", flush=True)
 
-        if pool.compressed_segments is not None:
+        if pool.kv_compressor is not None:
             stats = self.quantization_stats(model_id)
-            compressed_bytes = stats.get("compressed_bytes", 0)
-            num_compressed_requests = stats.get("compressed_requests", 0)
-            print(f"[KV Cache] TurboQuant compressed data = {_fmt(compressed_bytes)}", flush=True)
-            print(f"[KV Cache] TurboQuant compressed requests = {num_compressed_requests}", flush=True)
+            quant_bytes = stats.get("quant_buffer_bytes", 0)
+            total_extra = quant_bytes
+            print(f"[KV Cache] quant buffers = {_fmt(quant_bytes)}", flush=True)
             if total_kv_bytes > 0:
-                print(f"[KV Cache] effective memory (bf16 + compressed) = {_fmt(total_kv_bytes + compressed_bytes)}", flush=True)
-            # Compare actual pages vs pages needed per request without compression.
-            # Without TurboQuant each sequence would need max_blocks_per_seq pages.
+                print(f"[KV Cache] total (bf16 + quant) = {_fmt(total_kv_bytes + total_extra)}", flush=True)
             pages_per_seq_uncompressed = pool.max_blocks_per_seq
             print(
-                f"[KV Cache] pages per request: compressed pool={total_pages}, "
+                f"[KV Cache] pages per request: pool={total_pages}, "
                 f"uncompressed would need={pages_per_seq_uncompressed} per request",
                 flush=True,
             )
@@ -798,24 +717,21 @@ class KvCacheManager:
     def quantization_stats(self, model_id: str) -> dict:
         """Return memory usage stats for compressed KV cache."""
         pool = self._pool(model_id)
-        if pool.compressed_segments is None:
+        if pool.kv_compressor is None:
             return {"enabled": False}
-        total_compressed_bytes = 0
-        total_segments = 0
-        for req_segments in pool.compressed_segments.values():
-            for segment in req_segments.values():
-                for tensor in segment.compressed_k.values():
-                    if isinstance(tensor, torch.Tensor):
-                        total_compressed_bytes += tensor.numel() * tensor.element_size()
-                for tensor in segment.compressed_v.values():
-                    if isinstance(tensor, torch.Tensor):
-                        total_compressed_bytes += tensor.numel() * tensor.element_size()
-                total_segments += 1
+        quant_bytes = 0
+        if pool.quant_key_indices is not None:
+            quant_bytes += pool.quant_key_indices.numel() * pool.quant_key_indices.element_size()
+        if pool.quant_key_norms is not None:
+            quant_bytes += pool.quant_key_norms.numel() * pool.quant_key_norms.element_size()
+        if pool.quant_val_indices is not None:
+            quant_bytes += pool.quant_val_indices.numel() * pool.quant_val_indices.element_size()
+        if pool.quant_val_norms is not None:
+            quant_bytes += pool.quant_val_norms.numel() * pool.quant_val_norms.element_size()
         return {
             "enabled": True,
-            "total_segments": total_segments,
-            "compressed_bytes": total_compressed_bytes,
-            "compressed_requests": len(pool.compressed_segments),
+            "quant_buffer_bytes": quant_bytes,
+            "quant_requests": len(pool.request_quant_states),
         }
 
     def _pool(self, model_id: str) -> _CachePool:

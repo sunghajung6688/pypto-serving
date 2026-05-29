@@ -103,9 +103,14 @@ class _CompiledKernels:
     l3_generate_platform: str | None = None
     l3_generate_runtime_name: str | None = None
     l3_generate_param_infos: object | None = None
-    # TurboQuant KV cache compression kernels. None when kv_quant is disabled.
+    # KV cache quantization NPU kernels. None when disabled or using PyTorch fallback.
     tq_compress: _L2Callable | None = None
     tq_decompress: _L2Callable | None = None
+    # TQ fused-dequant kernels for prefill and decode. None when kv-quant disabled.
+    prefill_tq: _L2Callable | None = None
+    decode_tq: _L2Callable | None = None
+    # Per-layer rotation matrices (stacked [num_layers * head_dim, head_dim] BF16).
+    rot_matrices: torch.Tensor | None = None
 
 
 @dataclass
@@ -163,10 +168,18 @@ class Qwen314BModelRunner(ModelRunner):
         self._l2_child_allocs: dict[tuple[str, int], tuple[int, int]] = {}
         self._l2_dirty_kv_models: set[str] = set()
 
-    def run_tq_compress(self, flat_kv, inv_scales, offset):
-        """INT-N KV quantize: per-row absmax -> UINT8.
+    def run_tq_compress(self, flat_kv, rot_matrix, lo, inv_step, n_levels_m1):
+        """TurboQuant compress: L2 norm + rotate + fixed-range quantize.
 
-        Uses NPU kernel when available, otherwise falls back to PyTorch.
+        Args:
+            flat_kv: (N, D) BF16 tensor.
+            rot_matrix: (D, D) BF16 rotation matrix.
+            lo: float, lower bound of quantization range.
+            inv_step: float, 1 / step_size.
+            n_levels_m1: int, n_levels - 1.
+
+        Returns:
+            (indices, norms) — indices (N, D) uint8, norms (N, 1) float16.
         """
         import torch
 
@@ -175,50 +188,60 @@ class Qwen314BModelRunner(ModelRunner):
             n = flat_kv.shape[0]
             d = flat_kv.shape[1]
             indices_out = torch.zeros(n, d, dtype=torch.uint8, device="cpu")
+            norms_out = torch.zeros(n, 1, dtype=torch.float16, device="cpu")
 
             self._run_l2_program(
                 compiled.tq_compress,
                 flat_kv.contiguous().cpu(),
-                inv_scales.contiguous().cpu(),
-                ctypes.c_float(offset),
+                rot_matrix.contiguous().cpu(),
+                ctypes.c_float(lo),
+                ctypes.c_float(inv_step),
+                ctypes.c_int(n_levels_m1),
                 indices_out,
+                norms_out,
             )
-            return indices_out
+            return indices_out, norms_out
 
         # Fallback: pure PyTorch
-        x = flat_kv.float()
-        inv_s = inv_scales.float()
-        scaled = x * inv_s + offset
-        indices = torch.clamp(torch.floor(scaled).long(), 0, 255).to(torch.uint8)
-        return indices
+        flat = flat_kv.float()
+        vec_norms = torch.norm(flat, dim=-1, keepdim=True).clamp(min=1e-8)
+        flat_norm = flat / vec_norms
+        rotated = flat_norm @ rot_matrix.float().T
+        scaled = (rotated - lo) * inv_step
+        indices = torch.clamp(scaled.floor().long(), 0, n_levels_m1).to(torch.uint8)
+        return indices, vec_norms.squeeze(-1).half()
 
-    def run_tq_decompress(self, indices, scales, offset):
-        """INT-N KV dequantize: UINT8 -> BF16.
+    def run_tq_decompress(self, centroid_vals, rot_matrix, norms):
+        """TurboQuant decompress: inverse rotate + scale by norms.
 
-        Uses NPU kernel when available, otherwise falls back to PyTorch.
+        Args:
+            centroid_vals: (N, D) BF16 — already looked-up centroids.
+            rot_matrix: (D, D) BF16 rotation matrix.
+            norms: (N, 1) FP16 or BF16 norms.
+
+        Returns:
+            (N, D) BF16 reconstructed tensor.
         """
         import torch
 
         compiled = self._compiled
         if compiled.tq_decompress is not None:
-            n = indices.shape[0]
-            d = indices.shape[1]
+            n = centroid_vals.shape[0]
+            d = centroid_vals.shape[1]
             reconstructed_out = torch.zeros(n, d, dtype=torch.bfloat16, device="cpu")
 
             self._run_l2_program(
                 compiled.tq_decompress,
-                indices.contiguous().cpu(),
-                scales.contiguous().cpu(),
-                ctypes.c_float(offset),
+                centroid_vals.contiguous().cpu(),
+                rot_matrix.contiguous().cpu(),
+                norms.contiguous().cpu(),
                 reconstructed_out,
             )
             return reconstructed_out
 
         # Fallback: pure PyTorch
-        q = indices.float()
-        s = scales.float()
-        result = (q - offset) * s
-        return result.to(torch.bfloat16)
+        rotated = centroid_vals.float() @ rot_matrix.float()
+        return (rotated * norms.float()).to(torch.bfloat16)
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Run the JIT all-layer prefill kernel and return next-token logits."""
@@ -282,14 +305,8 @@ class Qwen314BModelRunner(ModelRunner):
         compiled = self._compiled
         dw = compiled.decode_weights
         model_id = model.config.model_id
-
-        # ── KV quantization: restore compressed old tokens BEFORE building
-        # block_table so that workspace pages are included in page_ids. ──
-        t_tq_restore = time.perf_counter()
-        if self._kv_cache_manager.is_quantization_enabled(model_id):
-            for alloc in batch.kv_allocations:
-                self._kv_cache_manager.restore_compressed_tokens(model_id, alloc, npu_runner=self)
-        dt_tq_restore = (time.perf_counter() - t_tq_restore) * 1000
+        use_tq = (self._kv_cache_manager.is_quantization_enabled(model_id)
+                  and hasattr(compiled, "decode_tq") and compiled.decode_tq is not None)
 
         decode_inputs = self._prepare_decode_inputs(model, batch)
         hidden = decode_inputs.hidden
@@ -487,6 +504,61 @@ class Qwen314BModelRunner(ModelRunner):
             shape=shape,
             dtype=torch_dtype_to_datatype(tensor.dtype),
         )
+
+    def _sync_kv_page_from_npu(
+        self,
+        model_id: str,
+        alloc: KvAllocation,
+    ) -> None:
+        """Copy the page containing the latest token's KV from NPU back to CPU.
+
+        This is needed so that CPU-side key_pages/value_pages stay in sync
+        with NPU after the decode kernel writes new token KV via slot_mapping.
+        """
+        pool = self._kv_cache_manager._pool(model_id)
+        if pool.key_pages.device.type != "cpu":
+            return
+
+        tokens_used = alloc.tokens_used
+        if tokens_used <= 0:
+            return
+
+        page_idx = (tokens_used - 1) // pool.page_size
+        if page_idx >= len(alloc.page_ids):
+            return
+        physical_page = alloc.page_ids[page_idx]
+
+        # Bytes per page per layer in key_pages: H * S * D * element_size
+        page_bytes = pool.num_kv_heads * pool.page_size * pool.head_dim * pool.key_pages.element_size()
+
+        # Get NPU dev_ptr for key_pages and value_pages child allocations.
+        runtime_name = self._compiled.decode.runtime_name
+        k_cache, v_cache = self._kv_cache_manager.materialize_full_layer_cache(model_id)
+
+        for cache_tensor, pages_tensor in [
+            (k_cache, pool.key_pages),
+            (v_cache, pool.value_pages),
+        ]:
+            storage = pages_tensor.untyped_storage()
+            storage_ptr = int(storage.data_ptr())
+            key = (runtime_name, storage_ptr)
+            child_alloc = self._l2_child_allocs.get(key)
+            if child_alloc is None:
+                continue
+            dev_ptr = child_alloc[0]
+
+            # Offset for this page across all layers.
+            # key_pages shape: [num_layers, num_pages, H, S, D]
+            # Flattened: layers are stacked, each layer has num_pages * H * S * D * el_size bytes.
+            layer_stride = pool.key_pages.shape[1] * page_bytes  # bytes per layer
+            for layer_idx in range(pool.num_layers):
+                offset = layer_idx * layer_stride + physical_page * page_bytes
+                worker = self._worker_for_runtime(runtime_name)
+                worker.copy_from(
+                    storage_ptr + offset,
+                    dev_ptr + offset,
+                    page_bytes,
+                )
 
     @staticmethod
     def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
